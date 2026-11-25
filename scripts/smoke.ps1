@@ -7,7 +7,9 @@
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
 # -Title prints the given label instead. Use the same one for the main and the PR run.
-# -OutDir also saves the launcher streams in stdout.txt and stderr.txt. Each run replaces both files.
+# With -OutDir, each completed launcher run replaces stdout.txt and stderr.txt.
+# Use a fresh -OutDir for each run you compare. If the launcher exits before printing a log path,
+# an existing manifest.json, xcl.log and report.json can still describe the previous run.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
