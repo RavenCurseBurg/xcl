@@ -41,11 +41,32 @@ function Get-Rank([double[]]$Sorted, [double]$Q) {
 
 # Rows of an XCL_PIPELINE_TIMES file: hash, bytes, outcome, wait ms, driver ms.
 function Read-Times([string]$Path) {
-    if (-not (Test-Path $Path)) { return @() }
-    Get-Content $Path | Where-Object { $_ } | ForEach-Object {
-        $f = $_.Split(',')
-        [pscustomobject]@{ Hash = $f[0]; Bytes = [long]$f[1]; Outcome = $f[2]; WaitMs = [double]$f[3]; DriverMs = [double]$f[4] }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "timing file '$Path' is missing" }
+    $lineNumber = 0; $rowCount = 0
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $lineNumber++
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $where = "timing file '$Path', line ${lineNumber}"
+        $f = $line.Split(',')
+        if ($f.Count -ne 5) { throw "${where}: expected five fields (hash, bytes, outcome, wait ms, driver ms)" }
+        if ($f[0] -notmatch '^[0-9a-fA-F]{16}$') { throw "${where}: hash must contain 16 hexadecimal digits" }
+        $bytes = 0L
+        if (-not [long]::TryParse($f[1], [Globalization.NumberStyles]::None, $culture, [ref]$bytes) -or $bytes -le 0) {
+            throw "${where}: bytes must be a positive 64-bit integer"
+        }
+        if (@('made', 'refused', 'reused') -cnotcontains $f[2]) { throw "${where}: unknown outcome '$($f[2])'" }
+        $waitMs = 0.0; $driverMs = 0.0
+        if (-not [double]::TryParse($f[3], [Globalization.NumberStyles]::Float, $culture, [ref]$waitMs) -or
+            -not [double]::TryParse($f[4], [Globalization.NumberStyles]::Float, $culture, [ref]$driverMs) -or
+            [double]::IsNaN($waitMs) -or [double]::IsInfinity($waitMs) -or $waitMs -lt 0 -or
+            [double]::IsNaN($driverMs) -or [double]::IsInfinity($driverMs) -or $driverMs -lt 0) {
+            throw "${where}: wait and driver milliseconds must be finite non-negative numbers"
+        }
+        $rowCount++
+        [pscustomobject]@{ Hash = $f[0]; Bytes = $bytes; Outcome = $f[2]; WaitMs = $waitMs; DriverMs = $driverMs }
     }
+    if ($rowCount -eq 0) { throw "timing file '$Path' has no measurement rows" }
 }
 
 $Buckets = @(@('< 64 KiB', 0, 64KB), @('64-256 KiB', 64KB, 256KB), @('256 KiB-1 MiB', 256KB, 1MB), @('1-4 MiB', 1MB, 4MB), @('>= 4 MiB', 4MB, [long]::MaxValue))
@@ -102,7 +123,7 @@ if ($prep.Exit -ne 0) { throw "the DXIL pass failed ($($prep.Exit)):`n$($prep.Ou
 $results = @()
 foreach ($n in $Threads) {
     $times = Join-Path $Out "times-$n.csv"
-    Remove-Item $times -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $times -ErrorAction SilentlyContinue
     $vars = @{ XCL_DXIL_CACHE = $dxil; XCL_PSO_DISK_CACHE = '0'; XCL_PIPELINE_THREADS = "$n"; XCL_PIPELINE_TIMES = $times }
     if ($ClearNvCache) {
         $nv = Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'
@@ -129,4 +150,4 @@ foreach ($r in $results) { "| $($r.threads) | $($r.wall_s) | $($r.cpu_s) | $($r.
 '| threads | DXIL size | made | driver s (sum) | p50 s | p95 s |'
 '|---:|---|---:|---:|---:|---:|'
 foreach ($r in $results) { foreach ($b in $r.buckets) { "| $($r.threads) | $($b.bucket) | $($b.made) | $($b.driver_s) | $($b.p50_s) | $($b.p95_s) |" } }
-$results | Select-Object threads, wall_s, cpu_s, peak_commit_mb, made, refused, reused, driver_s, p50_s, p95_s, max_s | Export-Csv -NoTypeInformation -Path (Join-Path $Out 'summary.csv')
+$results | Select-Object threads, wall_s, cpu_s, peak_commit_mb, made, refused, reused, driver_s, p50_s, p95_s, max_s | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $Out 'summary.csv')

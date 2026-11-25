@@ -133,6 +133,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
   sets the cap in KiB (0 turns it off).
+- **Cold PSO benchmark:** `scripts/cold-pso-bench.ps1 -Shaders <pack-or-folder> -Threads 4,8`
+  writes a thread-count comparison to `summary.csv`. A missing, empty or malformed timing file
+  stops the run instead of reporting a zero-cost measurement.
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
