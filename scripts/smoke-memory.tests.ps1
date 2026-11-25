@@ -30,9 +30,12 @@ try {
     Assert-Memory '{"d3d12":{"adapter":"Fixture GPU (12 MiB VRAM)"}}' 'n/a'
     Assert-Memory '{"d3d12":{"adapter":"Fixture GPU (12 MiB VRAM)","uma_mb":null}}' 'n/a'
     Assert-Memory '{"d3d12":{"adapter":"Fixture GPU (12 MiB VRAM)","uma_mb":"bad"}}' 'n/a'
+    foreach ($value in 'true', 'false', '1.6', '""', '[512]') {
+        Assert-Memory ('{"d3d12":{"adapter":"Fixture GPU (12 MiB VRAM)","uma_mb":' + $value + '}}') 'n/a'
+    }
     Assert-Memory '{"d3d12":' 'n/a'
     Assert-Memory $null 'n/a'
-    'smoke-memory: ok (8 cases)'
+    'smoke-memory: ok (13 cases)'
 } finally {
     Remove-Item -LiteralPath $report, $log, $xcl -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixture -Force

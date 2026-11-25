@@ -83,7 +83,10 @@ if (Test-Path $report) {
     try {
         $device = (Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12
         $gpu = ($device.adapter -replace '\s*\([^()]*VRAM\)$', '')
-        if ($null -ne $device.uma_mb) { $coherent = '{0} MB' -f [uint64]$device.uma_mb }
+        [uint64]$mb = 0
+        if ($device.uma_mb -isnot [array] -and [uint64]::TryParse([string]$device.uma_mb, [ref]$mb)) {
+            $coherent = '{0} MB' -f $mb
+        }
     } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
