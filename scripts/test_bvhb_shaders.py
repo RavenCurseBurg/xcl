@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parent / "re" / "bvhb_shaders.py"
@@ -22,6 +23,20 @@ def summarize_root(root, folder):
 
 
 class RootDescriptorTests(unittest.TestCase):
+    def test_unbounded_ranges_on_a_legacy_output_encoding(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                root = struct.pack("<6I", version, 1, 24, 0, 0, 0)
+                root += struct.pack("<3I2I", 0, 0, 36, 2, 44)
+                for count, space, offset in ((2, 0, 0), (0xFFFFFFFF, 5, 2)):
+                    root += struct.pack("<4I", 0, count, 0, space)
+                    if version == 2:
+                        root += struct.pack("<I", 1)
+                    root += struct.pack("<I", offset)
+                with patch.dict("os.environ", PYTHONIOENCODING="cp1252:strict"):
+                    text = summarize_root(root, Path(tmp))
+                self.assertIn("table[SRVx2@0,SRVxunbounded@0 space5]", text)
+
     def test_root_descriptors_print_their_register_classes(self):
         for version in (1, 2):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:

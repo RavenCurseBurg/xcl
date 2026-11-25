@@ -34,7 +34,8 @@ def rts0(r):
             rs = []
             for j in range(nr):
                 w = struct.unpack_from('<6I' if ver >= 2 else '<5I', r, roff + (24 if ver >= 2 else 20) * j)
-                rs.append(f'{RANGE[w[0]]}x{w[1] if w[1] != 0xFFFFFFFF else "∞"}@{w[2]}{space_suffix(w[3])}')
+                count = 'unbounded' if w[1] == 0xFFFFFFFF else w[1]
+                rs.append(f'{RANGE[w[0]]}x{count}@{w[2]}{space_suffix(w[3])}')
             out.append('table[' + ','.join(rs) + ']')
         elif ty == 1:
             reg, space, num = struct.unpack_from('<3I', r, pay)
