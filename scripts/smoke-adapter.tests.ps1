@@ -54,6 +54,12 @@ try {
     $cimMode = 'available'
     Test-SmokeAdapter 'Fixture Controller'
 
+    [IO.File]::WriteAllText($report, '{"d3d12":{"adapter":"   "}}')
+    Test-SmokeAdapter 'Fixture Controller'
+    $cimMode = 'unavailable'
+    Test-SmokeAdapter 'unknown'
+
+    $cimMode = 'available'
     [IO.File]::WriteAllText($report, '{"d3d12":{"adapter":"Report GPU (4096 MiB VRAM)"}}')
     Test-SmokeAdapter 'Report GPU'
     'smoke-adapter: ok'

@@ -87,7 +87,7 @@ $report = Join-Path (Split-Path $log -Parent) 'report.json'
 if (Test-Path $report) {
     try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
 }
-if (-not $gpu) {
+if ([string]::IsNullOrWhiteSpace($gpu)) {
     try {
         $gpu = (Get-CimInstance Win32_VideoController -ErrorAction Stop |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) -and $_.Name -notmatch 'Basic' } |
@@ -96,7 +96,7 @@ if (-not $gpu) {
         # A run can lack a report, and CIM can be unavailable. Keep the crash summary.
     }
 }
-if (-not $gpu) { $gpu = 'unknown' }
+if ([string]::IsNullOrWhiteSpace($gpu)) { $gpu = 'unknown' }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
