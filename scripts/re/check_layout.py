@@ -84,12 +84,12 @@ def check_listing(name, lst, consts, descs):
         return 0, 0
     pair = f's[{lo_reg}:{hi_reg}]'
     loads = re.findall(
-        r's_load_dword(x\d+)? s\[?(\d+)(?::(\d+))?\]?, ' + re.escape(pair) + r', (0x[0-9a-f]+)',
+        r's_load_dword(x\d+)? s\[?(\d+)(?::(\d+))?\]?, ' + re.escape(pair) + r', (0x[0-9a-f]+|null)\b',
         lst,
     )
     ok = bad = 0
     for w, lo, hi, off in loads:
-        off = int(off, 16)
+        off = 0 if off == 'null' else int(off, 16)
         nbytes = 4 * (int(w[1:]) if w else 1)
         good = off in descs or any(a <= off < b for a, b in consts) or (off - 4) in descs  # high half of a VA
         if good:

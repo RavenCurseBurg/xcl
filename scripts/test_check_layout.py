@@ -170,6 +170,7 @@ class CheckLayoutDirectoryAndCliTests(unittest.TestCase):
             "  s_mov_b32 s4, s0\n"
             "  s_and_b32 s5, s1, 0xff\n"
             "  s_load_dword s6, s[4:5], 0x0\n"
+            "  s_load_dword s6, s[4:5], null\n"
             "  s_load_dword s7, s[4:5], 0x4\n"
             "  s_load_dwordx2 s[8:9], s[4:5], 0x8\n"
             "  s_load_dword s10, s[4:5], 0x14\n"
@@ -182,7 +183,7 @@ class CheckLayoutDirectoryAndCliTests(unittest.TestCase):
         )
 
         for label, listing, expected_rc, expected_summary in (
-            ("on_boundary", on_boundary_asm, 0, "loads on parameter boundaries: 4, off: 0"),
+            ("on_boundary", on_boundary_asm, 0, "loads on parameter boundaries: 5, off: 0"),
             ("off_boundary", off_boundary_asm, 1, "loads on parameter boundaries: 1, off: 1"),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
