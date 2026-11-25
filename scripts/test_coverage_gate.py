@@ -67,6 +67,7 @@ class GateCommandTests(unittest.TestCase):
             xcl, pack = root / "xcl.exe", root / "shaders.rpf"
             xcl.touch()
             pack.touch()
+            run_sweep.return_value.returncode = 0
             run_sweep.return_value.stdout = json.dumps({"stages": STAGES})
             run_sweep.return_value.stderr = ""
             result = main(["--xcl", str(xcl), "--rpf", str(pack), "--update", "--baseline", str(root / "baseline.json")])
