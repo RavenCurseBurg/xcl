@@ -1044,7 +1044,6 @@ fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Opt
 }
 
 fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> Result<(), MeasureError> {
-    use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D12::*;
     use MeasureError::{Failed, Unavailable};
 
@@ -1056,10 +1055,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     let pipeline = Pipelines::new().map_err(|e| Unavailable(format!("no GPU device: {e}")))?;
     // before translating and compiling (tens of seconds for a big program): a machine that
     // cannot turn the caches off fails at once
-    let dev9 = pipeline.dev.cast::<ID3D12Device9>().map_err(|e| Unavailable(format!("ID3D12Device9 is required to disable the driver cache: {e}")))?;
-    let cache_kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER;
-    unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
-        .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
+    disable_implicit_shader_caches(&pipeline.dev).map_err(Unavailable)?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
     let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
     let dxc_start = std::time::Instant::now();
@@ -1137,6 +1133,26 @@ struct Pipelines {
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
+    /// `XCL_PIPELINE_TIMES=<file>`: one `timing_line` per pipeline, for benchmarks of the driver
+    times: Option<Mutex<std::fs::File>>,
+}
+
+/// Turns off the D3D and driver shader caches of `dev` for this process, so a driver compile
+/// is timed cold. Needs Windows Developer Mode; without it this fails rather than letting a
+/// warm cache pass for a cold build.
+fn disable_implicit_shader_caches(dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> Result<(), String> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let dev9 = dev.cast::<ID3D12Device9>().map_err(|e| format!("ID3D12Device9 is required to disable the driver cache: {e}"))?;
+    let kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER;
+    unsafe { dev9.ShaderCacheControl(kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }.map_err(|e| format!("cannot disable the driver cache (Windows Developer Mode is required): {e}"))
+}
+
+/// A line of `XCL_PIPELINE_TIMES`: the DXIL's hash and size, what came of it (`made`: compiled
+/// by the driver, `reused`: from a driver blob, `refused`), the wait for a compile slot and the
+/// time inside `CreateComputePipelineState`, in milliseconds.
+fn timing_line(dxil: &[u8], outcome: &str, wait: std::time::Duration, driver: std::time::Duration) -> String {
+    format!("{:016x},{},{outcome},{:.1},{:.1}", crate::gpu::shader::fnv64(dxil), dxil.len(), wait.as_secs_f64() * 1000.0, driver.as_secs_f64() * 1000.0)
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1216,7 +1232,15 @@ impl Pipelines {
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil })
+            // `XCL_PIPELINE_CACHE_OFF=1`: every compile cold, or no pass at all
+            if std::env::var("XCL_PIPELINE_CACHE_OFF").is_ok_and(|v| v.trim() == "1") {
+                disable_implicit_shader_caches(&dev)?;
+            }
+            let times = match std::env::var_os("XCL_PIPELINE_TIMES") {
+                Some(p) => Some(Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("XCL_PIPELINE_TIMES {}: {e}", PathBuf::from(&p).display()))?)),
+                None => None,
+            };
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil, times })
         }
     }
 
@@ -1262,6 +1286,7 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
+        let waited = std::time::Instant::now();
         {
             let mut n = self.running.0.lock().unwrap();
             while *n >= self.most {
@@ -1269,6 +1294,8 @@ impl Pipelines {
             }
             *n += 1;
         }
+        let wait = waited.elapsed();
+        let started = std::time::Instant::now();
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
@@ -1290,12 +1317,16 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
+        let mut driver = started.elapsed();
+        let reused = from_cache.is_some();
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            let cold = std::time::Instant::now();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            driver = cold.elapsed();
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
@@ -1310,6 +1341,11 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        if let Some(f) = &self.times {
+            let outcome = if r.is_err() { "refused" } else if reused { "reused" } else { "made" };
+            use std::io::Write;
+            let _ = writeln!(f.lock().unwrap(), "{}", timing_line(&c.dxil, outcome, wait, driver));
+        }
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1331,7 +1367,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         match Pipelines::new() {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
+                eprintln!("xcl shaders --pipelines: no pipelines can be made: {e}");
                 return 2;
             }
         }
@@ -1802,6 +1838,19 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// `XCL_PIPELINE_TIMES` lines: hash and size of the DXIL, the outcome, then the slot wait and
+    /// the driver time in milliseconds with one decimal.
+    #[test]
+    fn pipeline_timing_lines_name_the_dxil_outcome_and_both_times() {
+        use std::time::Duration;
+        let dxil = vec![7u8; 1500];
+        let line = super::timing_line(&dxil, "made", Duration::from_micros(2_345), Duration::from_millis(9_876));
+        assert_eq!(line, format!("{:016x},1500,made,2.3,9876.0", crate::gpu::shader::fnv64(&dxil)));
+        let fields: Vec<&str> = line.split(',').collect();
+        assert_eq!(fields.len(), 5);
+        assert!(super::timing_line(&dxil, "refused", Duration::ZERO, Duration::ZERO).ends_with(",refused,0.0,0.0"));
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
