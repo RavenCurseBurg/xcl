@@ -5,6 +5,7 @@ from pr_check import check, smoke_blocks
 
 
 HEAD = "1234567890abcdef"
+BASE = "1111111aaaabcdef"
 BODY = "**Tested**\nSynthetic fixtures\n**Not tested**\nRetail titles\n**AI use**\nNone\n"
 
 
@@ -15,10 +16,10 @@ def changed(path, binary=False):
 class TestOnlyApprovalTests(unittest.TestCase):
     def test_runtime_path_requires_smoke_until_approved(self):
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
-        problems = check(BODY, HEAD, files, lambda _: False)
+        problems = check(BODY, HEAD, BASE, files)
         self.assertEqual(2, len(problems))
         self.assertTrue(all("Regression run" in problem for problem in problems))
-        self.assertEqual([], check(BODY, HEAD, files, lambda _: False, test_only=True))
+        self.assertEqual([], check(BODY, HEAD, BASE, files, test_only=True))
 
     def test_approval_keeps_description_and_asset_checks(self):
         files = [
@@ -27,7 +28,7 @@ class TestOnlyApprovalTests(unittest.TestCase):
             changed("notes/attachment.txt", binary=True),
         ]
         body = "**Tested**\nSynthetic fixtures\n**AI use**\nQwen\n"
-        problems = check(body, HEAD, files, lambda _: False, test_only=True)
+        problems = check(body, HEAD, BASE, files, test_only=True)
         self.assertEqual(4, len(problems))
         for reason in ("Not tested", "AI use", "content.rpf", "attachment.txt"):
             self.assertTrue(any(reason in problem for problem in problems), problems)
@@ -36,23 +37,23 @@ class TestOnlyApprovalTests(unittest.TestCase):
         for path in ("crates/xcl/data/stubdb.toml", "crates/xcl/build.rs", "crates/xcl/Cargo.toml",
                      "Cargo.toml", "Cargo.lock"):
             with self.subTest(path=path):
-                problems = check(BODY, HEAD, [changed(path)], lambda _: False)
+                problems = check(BODY, HEAD, BASE, [changed(path)])
                 self.assertEqual(2, len(problems))
                 self.assertTrue(all("Regression run" in problem for problem in problems))
-                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False, test_only=True))
+                self.assertEqual([], check(BODY, HEAD, BASE, [changed(path)], test_only=True))
         for path in ("tests/testtitle/Cargo.toml", "tests/testgamedll/build.rs", "crates/xcl/tests/data/x.toml"):
             with self.subTest(path=path):
-                self.assertEqual([], check(BODY, HEAD, [changed(path)], lambda _: False))
+                self.assertEqual([], check(BODY, HEAD, BASE, [changed(path)]))
 
     def test_test_paths_do_not_need_approval(self):
         files = [changed("crates/xcl/tests/integration.rs"), changed("crates/xcl/src/gpu/recomp/tests.rs")]
-        self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
+        self.assertEqual([], check(BODY, HEAD, BASE, files))
 
 
 class BannedModelTests(unittest.TestCase):
     def ai_use(self, line):
         body = BODY.replace("**AI use**\nNone\n", "**AI use**\n" + line + "\n")
-        return check(body, HEAD, [changed("README.md")], lambda _: True)
+        return check(body, HEAD, BASE, [changed("README.md")])
 
     def test_family_names_of_small_and_open_weight_models_are_refused(self):
         for model in ("CodeLlama 34B", "TinyLlama", "Codestral 22B", "Devstral Small", "QwQ-32B",
@@ -79,18 +80,18 @@ class SmokeBlockTests(unittest.TestCase):
         blocks = smoke_blocks(body)
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
-        self.assertEqual([], check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa"))
+        self.assertEqual([], check(BODY + body, HEAD, BASE, files))
 
     def test_blocks_in_separate_fences_stay_separate(self):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\n```\ntext\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
 
-    def smoke_problems(self, main_run, pr_run):
-        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + main_run + "```\n"
+    def smoke_problems(self, main_run, pr_run, main_commit="1111111aaaa"):
+        body = ("```\nxcl-smoke v1\ncommit: " + main_commit + "\n" + main_run + "```\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\n" + pr_run + "```\n")
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
-        return check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa")
+        return check(BODY + body, HEAD, BASE, files)
 
     def test_blocks_with_only_commit_lines_fail(self):
         problems = self.smoke_problems("", "")
@@ -128,12 +129,29 @@ class SmokeBlockTests(unittest.TestCase):
                 problems = self.smoke_problems(self.RUN, pr_run)
                 self.assertTrue(any(expected in p for p in problems), problems)
 
+    def test_main_block_must_be_the_exact_pr_base(self):
+        problems = self.smoke_problems(self.RUN, self.RUN, "0000000aaaa")
+        self.assertTrue(any(f"base commit {BASE[:12]}" in p for p in problems), problems)
+
+    def test_main_block_must_come_from_a_clean_checkout(self):
+        problems = self.smoke_problems(self.RUN, self.RUN, "1111111aaaa (uncommitted changes)")
+        self.assertTrue(any("main regression run was made with uncommitted changes" in p
+                            for p in problems), problems)
+
+    def test_several_matching_main_blocks_are_ambiguous(self):
+        main = "xcl-smoke v1\ncommit: 1111111aaaa\n" + self.RUN
+        body = ("```\n" + main + main + "```\n"
+                "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN + "```\n")
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        problems = check(BODY + body, HEAD, BASE, files)
+        self.assertTrue(any("several main blocks" in p for p in problems), problems)
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):
         template = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
         body = template.read_text(encoding="utf-8")
-        problems = check(body, HEAD, [changed("README.md")], lambda _: True)
+        problems = check(body, HEAD, BASE, [changed("README.md")])
         self.assertEqual(
             [
                 "the **Tested** section is missing or empty",
@@ -154,11 +172,11 @@ class TemplatePlaceholderTests(unittest.TestCase):
             "**AI use**\n"
             "- none\n"
         )
-        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
+        self.assertEqual([], check(body, HEAD, BASE, [changed("README.md")]))
 
     def test_bare_bullets_and_html_comments_only_fail(self):
         body = "**Tested**\n<!-- todo -->\n-\n**Not tested**\n*\n**AI use**\n  -  \n"
-        problems = check(body, HEAD, [changed("README.md")], lambda _: True)
+        problems = check(body, HEAD, BASE, [changed("README.md")])
         self.assertEqual(3, len(problems))
 
 
