@@ -70,8 +70,11 @@ def compare(base, head, noise=TIME_NOISE):
     """{rows, only_base, only_head, means, size_changes, time_changes, noise} for two
     {name: program} maps."""
     rows = []
+    dxc_args_changes = 0
     for name in sorted(set(base) & set(head)):
         b, h = base[name], head[name]
+        if b.get("dxc_args") != h.get("dxc_args"):
+            dxc_args_changes += 1
         rows.append({
             "name": name,
             "instructions": (b["instructions"], h["instructions"]),
@@ -89,6 +92,7 @@ def compare(base, head, noise=TIME_NOISE):
         "only_head": sorted(set(head) - set(base)),
         "means": means,
         "size_changes": size_changes,
+        "dxc_args_changes": dxc_args_changes,
         "time_changes": sum(1 for r in rows if r["changed"] == "time"),
         "noise": noise,
     }
@@ -105,6 +109,9 @@ def render(base_env, head_env, result):
         "",
     ]
     notes = environment_notes(base_env, head_env)
+    if result["dxc_args_changes"]:
+        notes.append(f"shared programs with different DXC arguments: {result['dxc_args_changes']} "
+                     "(DXIL sizes and compile times for these programs reflect different compiler settings)")
     out += [f"- note: {note}" for note in notes] + ([""] if notes else [])
     out += [
         "| program | instructions | HLSL bytes | × | DXIL bytes | × | DXC ms (median) | × | changed |",

@@ -61,6 +61,16 @@ class EnvironmentTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_dxc_arguments_are_compared_for_shared_programs(self):
+        base = {"a": dict(program("a"), dxc_args="-O1")}
+        head = {"a": dict(program("a"), dxc_args="-O1"), "new": dict(program("new"), dxc_args="-O3")}
+        self.assertNotIn("different DXC arguments", render(ENV, ENV, compare(base, head)))
+
+        head["a"]["dxc_args"] = "-O3"
+        report = render(ENV, ENV, compare(base, head))
+        self.assertIn("shared programs with different DXC arguments: 1", report)
+        self.assertIn("DXIL sizes and compile times", report)
+
     def test_table_rows_have_equal_columns(self):
         r = compare({"a": program("a"), "b": program("b", insts=7)}, {"a": program("a", dxil=0), "b": program("b", insts=9)})
         lines = [l for l in render(ENV, ENV, r).splitlines() if l.startswith("|")]
