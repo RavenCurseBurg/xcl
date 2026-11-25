@@ -34,6 +34,13 @@ try {
         try { $null = & $smoke -Game 'D:\Games\SomeTitle' -Seconds 1 -Xcl $xcl -Title $bad } catch { $threw = $true }
         if (-not $threw) { throw "-Title '$bad' was accepted" }
     }
+    # A single zero draw sample is still a measurement. This log has no VRAM samples.
+    [IO.File]::WriteAllText((Join-Path $fixture 'xcl.log'), 'activity (2 s): 0 presents, 1 submits, 0 draws')
+    $block = & $smoke -Game 'fixture' -Seconds 1 -Xcl $xcl
+    $lines = $block -split '\r?\n'
+    foreach ($expected in @('draws per 2 s (last 3): 0', 'video memory peak: n/a MB local, n/a MB non-local')) {
+        if ($lines -notcontains $expected) { throw "missing '$expected' in smoke block: $block" }
+    }
     'smoke-title: ok'
 } finally {
     Remove-Item -LiteralPath $fixture -Recurse -Force

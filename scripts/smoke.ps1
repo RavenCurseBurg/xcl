@@ -84,15 +84,15 @@ if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { 
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 # counts, not speed: draws keep the screen shape, the pipeline counters say what the run refused
 $draws = [regex]::Matches($text, 'activity \(2 s\): \d+ presents, \d+ submits, (\d+) draws') | ForEach-Object { [int]$_.Groups[1].Value }
-$lastDraws = if ($draws) { ($draws | Select-Object -Last 3) -join ' ' } else { 'n/a' }
+$lastDraws = if ($null -ne $draws) { ($draws | Select-Object -Last 3) -join ' ' } else { 'n/a' }
 $d = if ($rep) { $rep.d3d12 } else { $null }
 $translated = if ($d) { $d.translated_pipelines } else { 'n/a' }
 $refused = if ($d -and $d.translation_errors) { @($d.translation_errors).Count } else { 0 }
 $fallback = if ($d) { $d.fallback_pipelines } else { 'n/a' }
 $failed = if ($d) { $d.failed_pipelines } else { 'n/a' }
 $vm = [regex]::Matches($text, 'video memory (\d+) MB local, (\d+) MB non-local')
-$vlocal = if ($vm) { ($vm | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
-$vnon = if ($vm) { ($vm | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
+$vlocal = if ($vm.Count -gt 0) { ($vm | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
+$vnon = if ($vm.Count -gt 0) { ($vm | ForEach-Object { [int]$_.Groups[2].Value } | Measure-Object -Maximum).Maximum } else { 'n/a' }
 
 @"
 ``````
