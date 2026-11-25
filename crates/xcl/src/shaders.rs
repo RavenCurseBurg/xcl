@@ -2375,6 +2375,28 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             Ok(dxil) => dump("direct.dxil", dxil),
                             Err(e) => dump("direct.err.txt", e.as_bytes()),
                         }
+                        if let Some(dir) = &dump_dir {
+                            let manifest = serde_json::json!({
+                                "schema_version": 1,
+                                "backend": "direct-dxil",
+                                "record_hash": format!("{blob_hash:016x}"),
+                                "fssm_index": fi,
+                                "program_offset": p.offset,
+                                "stage": coverage::stage_name(&mode),
+                                "wave64": wave64,
+                                "split_wave64": o.split,
+                                "memory_windows": windows,
+                                "validation_requested": validate,
+                                "guest_fnv64": format!("{:016x}", shader::fnv64(code)),
+                                "dxil_fnv64": r.as_ref().ok().map(|bytes| format!("{:016x}", shader::fnv64(bytes))),
+                                "translation_wall_us": time.as_micros() as u64,
+                                "error": r.as_ref().err(),
+                            });
+                            let path = dir.join(format!("{blob_hash:016x}_f{fi}_{:x}.manifest.json", p.offset));
+                            if let Err(e) = std::fs::write(&path, manifest.to_string()) {
+                                eprintln!("direct: could not write {}: {e}", path.display());
+                            }
+                        }
                         let hlsl_size = (compare && r.is_ok())
                             .then(|| {
                                 let profile = match mode {
