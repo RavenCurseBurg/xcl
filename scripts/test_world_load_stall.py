@@ -147,6 +147,19 @@ class StallSummaryTests(unittest.TestCase):
         self.assertIn("Thread dump at 9.000 s: 0/0 thread lines parsed, 0 with a visible title frame", report)
         self.assertTrue(report.endswith("Sampled title-thread candidates: 0"))
 
+    def test_last_dump_at_same_millisecond_keeps_partial_coverage(self):
+        lines = [
+            activity(8, 5), activity(10, 0),
+            *thread_dump(10, "thread 4 'older': xcl.exe+0x8 < sample+game.exe+0x3"),
+            *thread_dump(10, "thread 7 'latest': 0x140000000 < XCL.EXE+0x0 < Sample+Game.exe+0xa "
+                         "< xcl.exe+0xb < sample+game.exe+0xc", count=2),
+        ]
+        summary = summarize(lines)
+        report = summarize(lines, title_exe="SAMPLE+GAME.EXE")
+        self.assertEqual(report, summary + "\nThread dump at 10.000 s: 1/2 thread lines parsed, "
+                         "1 with a visible title frame (incomplete dump)\n"
+                         "Sampled title-thread candidates: 1\n  Thread 7: 0x0")
+
     def test_unterminated_last_thread_row_is_incomplete(self):
         report = summarize([
             activity(8, 50),
