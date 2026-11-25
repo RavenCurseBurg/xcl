@@ -94,7 +94,7 @@ Use this outline:
 - game checked (if any), and what got better, with numbers if you have them
 
 **Regression run**
-- for a runtime change: the two `xcl-smoke` blocks (main, this PR's head) – see above
+- for changes to the runtime or its build inputs, include both `xcl-smoke` blocks (main, this PR's head) – see above
 
 **Not tested**
 - what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs
