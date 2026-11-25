@@ -9,8 +9,9 @@
 
 **Regression run**
 <!-- Required when the PR changes crates/xcl/src outside tests: `scripts/smoke.ps1` on a real title,
-     built from main and from this PR's head commit (no uncommitted changes); paste both blocks.
-     Rerun the PR's after every push. Not needed for docs / tests / scripts only. -->
+     built from clean checkouts of the PR's exact base and head commits. Paste one baseline for
+     the same title and duration as the head run. Refresh the baseline when the base SHA changes
+     and rerun the head after every push. Not needed for docs / tests / scripts only. -->
 
 main:
 

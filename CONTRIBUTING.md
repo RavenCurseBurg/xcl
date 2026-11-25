@@ -18,10 +18,10 @@ checked before anything else; a PR that does not meet them waits (or is closed a
 2. **The whole suite ran on a GPU**, with the counts in **Tested**
    (`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored, and the SKIPPED tests).
 3. **A PR that changes the runtime** (`crates/xcl/src` outside tests) **has a regression run on a real
-   title**: `scripts/smoke.ps1 -Game <your game folder>` built from `main` and built from the PR's head
-   commit, both `xcl-smoke` blocks pasted under **Regression run**, of the same title for the same
-   time. The PR's block must name its head commit with no uncommitted changes (rerun it after every
-   push); the other must be made on a commit of `main`. The PR's run must show no device removal and
+   title**: run `scripts/smoke.ps1 -Game <your game folder>` on clean builds of the PR's exact base
+   and head commits. Use the same title and duration for both. Under **Regression run**, paste one
+   matching baseline block and the PR's block. Rerun the head after each push and refresh the
+   baseline when the PR's base SHA changes. The PR's run must show no device removal and
    no crash (the `main` run may: a PR that fixes a crash shows it there), at least 80 % of `main`'s
    frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
    changes still counts as a regression check; say what it does not cover under **Not tested**.
