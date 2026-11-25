@@ -11,6 +11,8 @@ use crate::config::Config;
 use crate::util::glob_match;
 
 pub mod acphal;
+pub mod bcpack;
+pub mod bink;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
@@ -21,6 +23,7 @@ pub mod kernelx;
 pub mod mfplat;
 pub mod netoff;
 pub mod opus;
+pub mod playstation;
 pub mod user;
 pub mod xaudio2;
 pub mod xma2;
@@ -111,6 +114,8 @@ fn build(config: &Config) -> Registry {
     ];
     let offline = netoff::enabled();
     if offline {
+        // the system's own network functions too, for whatever reaches them (#305)
+        netoff::install_system_hooks();
         let mut m = HleModule::new(netoff::NETOFF, netoff::exports(), &[SELF]);
         m.ordinals = netoff::ordinals().into_iter().collect();
         modules.push(m);
@@ -144,6 +149,7 @@ fn build(config: &Config) -> Registry {
         "kernel32legacy.dll",
         "advapi32legacy.dll",
         "minappmodelx.dll",
+        "xmem.dll",
         "api-ms-win-core-*",
         "ext-ms-win-core-*",
     ] {

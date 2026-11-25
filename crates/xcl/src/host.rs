@@ -21,14 +21,25 @@ pub fn host_main(boot_path: &Path) -> i32 {
         crate::log::Level::parse(&boot.config.log_level),
         boot.config.log_to_stderr,
     );
+    crate::log::log_panics();
     crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
     crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
+    crate::xlog_info!(
+        "console: {} (title memory {} MiB, mode {})",
+        if boot.config.is_series_s() { "Xbox Series S (lockhart)" } else { "Xbox Series X (anaconda)" },
+        boot.config.title_memory_mb,
+        boot.config.title_memory
+    );
 
     if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        crate::hle::d3d12x::real::log_dispatch_chain_counts();
+    });
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -105,6 +116,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
+    crate::hle::kernelx::fine_timer();
     crate::loader::set_cache_dir(boot.cache_dir());
     let mut dirs = vec![boot.game_root.clone()];
     if let Some(p) = boot.exe_path.parent() {
@@ -115,7 +127,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::resolver::set_search_dirs(dirs);
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
-    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
+    // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
+    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {

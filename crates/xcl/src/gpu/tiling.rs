@@ -6,10 +6,13 @@
 //! offset is linear over GF(2): `offset(x, y, z) = ox[x] ^ oy[y] ^ oz[z]`, small tables per
 //! layout. Blocks (256 B / 4 KB / 64 KB) are laid out row-major; `Chain` lays out the mips.
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
 use super::tiling_tables::{NIBBLE01, NIBBLE2, NIBBLE3, NIBBLE4, PATTERNS, PATTERNS_3D};
 
 /// The part of GB_ADDR_CONFIG the XOR modes depend on (number of pipes and packers, log2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PipeConfig {
     pub pipes_log2: u32,
     pub pkrs_log2: u32,
@@ -51,7 +54,7 @@ fn pattern_bits(table: &[(u32, &[[u16; 4]])], mode: u32, elem_log2: u32, cfg: Pi
 
 /// How one tiled surface of `1 << elem_log2`-byte elements (pixels, or 4×4 blocks for BCn)
 /// maps to memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub mode: u32,
     pub elem_log2: u32,
@@ -63,14 +66,34 @@ pub struct Layout {
     /// XORed into every in-block byte offset: the pipe / bank swizzle a T# base address carries
     /// in its low bits (`base & (block_bytes - 1)`), 0 otherwise
     pub base_xor: usize,
-    ox: Vec<u32>,
-    oy: Vec<u32>,
-    oz: Vec<u32>,
+    ox: &'static [u32],
+    oy: &'static [u32],
+    oz: &'static [u32],
     /// the in-block bits the coordinates above the block give (XOR modes with many pipes take
     /// pipe bits from neighbouring blocks' coordinates), by `x >> log2(block_w)` etc.
-    hx: Vec<u32>,
-    hy: Vec<u32>,
-    hz: Vec<u32>,
+    hx: &'static [u32],
+    hy: &'static [u32],
+    hz: &'static [u32],
+}
+
+/// Cached immutable tiling tables keyed by `(is_3d, mode, elem_log2, pipe_cfg)`.
+/// Only valid combinations (bounded by `PATTERNS` / `PATTERNS_3D` + linear mode 0) are inserted.
+static LAYOUT_CACHE: OnceLock<RwLock<HashMap<(bool, u32, u32, PipeConfig), Layout>>> = OnceLock::new();
+
+fn cached_layout(is_3d: bool, mode: u32, elem_log2: u32, cfg: PipeConfig, build: impl FnOnce() -> Option<Layout>) -> Option<Layout> {
+    let key_cfg = if is_xor(mode) { cfg } else { PipeConfig { pipes_log2: 0, pkrs_log2: 0 } };
+    let key = (is_3d, mode, elem_log2, key_cfg);
+    let cache = LAYOUT_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(&l) = cache.read().unwrap().get(&key) {
+        return Some(l);
+    }
+    let mut g = cache.write().unwrap();
+    if let Some(&l) = g.get(&key) {
+        return Some(l);
+    }
+    let l = build()?;
+    g.insert(key, l);
+    Some(l)
 }
 
 impl Layout {
@@ -81,17 +104,19 @@ impl Layout {
         if elem_log2 > 4 {
             return None;
         }
-        if mode == 0 {
-            let bw = 256 >> elem_log2;
-            let ox = (0..bw as u32).map(|x| x << elem_log2).collect();
-            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
-        }
-        let blk = block_log2(mode)?;
-        let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
-        // block size in elements: 256 B micro block, grown evenly in both directions
-        let (w256, h256) = [(4, 4), (4, 3), (3, 3), (3, 2), (2, 2)][elem_log2 as usize];
-        let amp = blk - 8;
-        Some(Self::from_bits(mode, elem_log2, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+        cached_layout(false, mode, elem_log2, cfg, || {
+            if mode == 0 {
+                let bw = 256 >> elem_log2;
+                let ox: &'static [u32] = (0..bw as u32).map(|x| x << elem_log2).collect::<Vec<_>>().leak();
+                return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: &[0], oz: &[0], hx: &[0], hy: &[0], hz: &[0] });
+            }
+            let blk = block_log2(mode)?;
+            let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
+            // block size in elements: 256 B micro block, grown evenly in both directions
+            let (w256, h256) = [(4, 4), (4, 3), (3, 3), (3, 2), (2, 2)][elem_log2 as usize];
+            let amp = blk - 8;
+            Some(Self::from_bits(mode, elem_log2, blk, &bits, (w256 + amp / 2, h256 + amp - amp / 2, 0)))
+        })
     }
 
     /// A 3D texture: the thick modes (4KB_S, 64KB_S / S_T, 4KB_S_X, 64KB_S_X, 64KB_D_X) tile
@@ -101,7 +126,7 @@ impl Layout {
     pub fn new_3d(mode: u32, elem_log2: u32, cfg: PipeConfig) -> Option<Layout> {
         match mode {
             0 | 24 | 27 => Self::new(mode, elem_log2, cfg),
-            5 | 9 | 17 | 21 | 25 | 26 if elem_log2 <= 4 => {
+            5 | 9 | 17 | 21 | 25 | 26 if elem_log2 <= 4 => cached_layout(true, mode, elem_log2, cfg, || {
                 let blk = block_log2(mode)?;
                 let bits = pattern_bits(PATTERNS_3D, mode, elem_log2, cfg)?;
                 // a 1 KB micro block (addrlib Block1K_3d), grown evenly in w, h, d
@@ -109,7 +134,7 @@ impl Layout {
                 let (w1k, h1k, d1k) = [(4, 3, 3), (3, 3, 3), (3, 3, 2), (3, 2, 2), (2, 2, 2)][elem_log2 as usize];
                 let (avg, rest) = ((blk - 10) / 3, (blk - 10) % 3);
                 Some(Self::from_bits(mode, elem_log2, blk, &bits, (w1k + avg, h1k + avg + rest / 2, d1k + avg + u32::from(rest != 0))))
-            }
+            }),
             _ => None,
         }
     }
@@ -117,7 +142,7 @@ impl Layout {
     /// The offset tables of a block `1 << wl` × `1 << hl` × `1 << dl` elements.
     fn from_bits(mode: u32, elem_log2: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
         // the in-block offset bits coordinate `c << lo` gives
-        let table = |n: usize, shift: u32, lo: u32| -> Vec<u32> {
+        let table = |n: usize, shift: u32, lo: u32| -> &'static [u32] {
             (0..n as u32)
                 .map(|c| {
                     let mut off = 0u32;
@@ -127,11 +152,15 @@ impl Layout {
                     }
                     off
                 })
-                .collect()
+                .collect::<Vec<_>>()
+                .leak()
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
         // the pattern masks are 16 bits: coordinates above them do not matter
-        let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        let high = |l: u32, shift: u32| {
+            let used = bits[..blk as usize].iter().fold(0u32, |m, &b| m | ((b >> shift) & 0xFFFF) as u32) >> l.min(16);
+            table(1 << (32 - used.leading_zeros()), shift, l)
+        };
         Layout {
             mode,
             elem_log2,
@@ -396,13 +425,43 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
+        let t = &self.layout;
+        let e = 1usize << t.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
+        if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
+            // linear: a row's elements are contiguous, so it is copied whole (the elements that
+            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
+            let row = l.width * e;
+            for y in 0..l.height {
+                let o = self.element_at(&l, 0, y, slice);
+                let n = src.len().saturating_sub(o).min(row) / e * e;
+                if n > 0 {
+                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
+                }
+            }
+            return out;
+        }
+        // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
+        // depends on y (and the slice) once per row – per element only two lookups and an XOR.
+        // Element by element it was most of a retail game's render thread while it streamed
+        // textures the CPU writes.
+        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
+        let pitch_blocks = l.pitch.div_ceil(t.block_w);
+        let columns: Vec<(usize, u32)> = (0..l.width)
+            .map(|x| {
+                let x = x + l.origin.0;
+                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
+            })
+            .collect();
+        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
+        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
+            let y = y + l.origin.1;
+            let row_blocks = (y / t.block_h) * pitch_blocks;
+            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
+            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
+                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
                 if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    dst.copy_from_slice(s);
                 }
             }
         }
@@ -447,6 +506,73 @@ mod tests {
         v
     }
 
+    /// Linear levels are copied a row at a time: the same bytes as element by element, for every
+    /// element size, padded rows, every mip and a source cut short (inside a row and inside an
+    /// element).
+    #[test]
+    fn linear_levels_detile_by_rows_as_by_elements() {
+        let by_elements = |c: &Chain, src: &[u8], i: usize| {
+            let l = c.levels[i];
+            let e = 1usize << c.layout.elem_log2;
+            let mut out = vec![0u8; l.width * l.height * e];
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at(&l, x, y, 0);
+                    if let Some(s) = src.get(o..o + e) {
+                        out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    }
+                }
+            }
+            out
+        };
+        for e in 0..5u32 {
+            for (w, h, mips) in [(3840u32, 4u32, 1u32), (1920, 3, 1), (77, 13, 4), (1, 1, 1), (300, 200, 9)] {
+                let c = Chain::new(Layout::new(0, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), w, h, 1, mips);
+                let full: Vec<u8> = (0..c.slice_bytes).map(|k| (k * 7 + 3) as u8 | 1).collect();
+                for cut in [full.len(), full.len() / 2 + 1, 5, 0] {
+                    let src = &full[..cut];
+                    for i in 0..c.levels.len() {
+                        assert_eq!(c.detile_level(src, i, 0), by_elements(&c, src, i), "e{e} {w}x{h} level {i} src {cut} B");
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// `detile_level` (offsets split by row and column) gives the bytes element-by-element
+    /// `element_at` does: every mode, element size and pipe configuration, every level (mip
+    /// tails too), a base swizzle and a slice, and a source cut short (bytes past it read as 0).
+    #[test]
+    fn detile_level_matches_element_by_element() {
+        for mode in MODES {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = (lay.block_bytes / 2) & !((1 << e) - 1);
+                    let c = Chain::new(lay, 77, 45, 1, 7);
+                    let mem: Vec<u8> = (0..c.slice_bytes * 2).map(|i| (i * 131 % 251) as u8).collect();
+                    let short = &mem[..mem.len() * 3 / 5];
+                    let es = 1usize << e;
+                    for (k, l) in c.levels.iter().enumerate() {
+                        for (slice, src) in [(0, &mem[..]), (3, short)] {
+                            let mut want = vec![0u8; l.width * l.height * es];
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(l, x, y, slice);
+                                    if let Some(s) = src.get(o..o + es) {
+                                        want[(y * l.width + x) * es..][..es].copy_from_slice(s);
+                                    }
+                                }
+                            }
+                            assert!(c.detile_level(src, k, slice) == want, "mode {mode} e {e} {cfg:?} level {k} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// every mode, element size and pipe configuration: the in-block mapping is a permutation
     /// of the block's elements (catches a mis-parsed table or a wrong block shape)
     #[test]
@@ -464,6 +590,45 @@ mod tests {
                             assert!(!std::mem::replace(&mut seen[o >> e], true), "mode {mode} e {e} {cfg:?}: ({x},{y}) collides");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn high_coordinate_tables_keep_their_offsets_at_one_period() {
+        let full = |bits: &[u64; 20], blk: u32, l: u32, shift: u32| -> Vec<u32> {
+            (0..1u32 << (16 - l.min(16)))
+                .map(|c| {
+                    let mut off = 0u32;
+                    for (i, &b) in bits[..blk as usize].iter().enumerate() {
+                        let mask = ((b >> shift) & 0xFFFF) as u32;
+                        off |= ((mask & (c << l)).count_ones() & 1) << i;
+                    }
+                    off
+                })
+                .collect()
+        };
+        let check = |l: &Layout, bits: &[u64; 20], what: &str| {
+            let blk = l.block_bytes.trailing_zeros();
+            for (t, b, shift) in [(&l.hx, l.block_w, 0), (&l.hy, l.block_h, 16), (&l.hz, l.block_d, 32)] {
+                let want = full(bits, blk, b.trailing_zeros(), shift);
+                assert!(t.len().is_power_of_two() && t.len() <= want.len(), "{what}: table of {} for {}", t.len(), want.len());
+                for c in (0..1usize << 18).step_by(3).chain([u32::MAX as usize, (1 << 40) + 5]) {
+                    assert_eq!(t[c % t.len()], want[c % want.len()], "{what}: shift {shift} coordinate block {c}");
+                }
+            }
+            assert!(l.hz.len() <= 64, "{what}: {} z entries", l.hz.len());
+        };
+        for cfg in configs() {
+            for e in 0..5 {
+                for mode in MODES {
+                    let l = Layout::new(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS, mode, e, cfg).unwrap(), &format!("2D mode {mode} e {e} {cfg:?}"));
+                }
+                for mode in [5u32, 9, 17, 21, 25, 26] {
+                    let l = Layout::new_3d(mode, e, cfg).unwrap();
+                    check(&l, &pattern_bits(PATTERNS_3D, mode, e, cfg).unwrap(), &format!("3D mode {mode} e {e} {cfg:?}"));
                 }
             }
         }
@@ -672,6 +837,40 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "mode {mode}, {} B elements", 1 << e);
         }
+    }
+
+    #[test]
+    fn layout_cache_shares_tables_and_isolates_base_xor() {
+        let cfg = PipeConfig { pipes_log2: 4, pkrs_log2: 3 };
+        let mut a = Layout::new(25, 4, cfg).unwrap();
+        let b = Layout::new(25, 4, cfg).unwrap();
+        assert!(std::ptr::eq(a.ox, b.ox) && std::ptr::eq(a.oy, b.oy) && std::ptr::eq(a.hx, b.hx));
+        a.base_xor = 0x1000;
+        assert_eq!(a.base_xor, 0x1000);
+        assert_eq!(Layout::new(25, 4, cfg).unwrap().base_xor, 0, "mutating base_xor must not taint cached Layout");
+
+        // Non-XOR mode shares the same cached tables regardless of PipeConfig.
+        let c1 = Layout::new(9, 4, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        let c2 = Layout::new(9, 4, cfg).unwrap();
+        assert!(std::ptr::eq(c1.ox, c2.ox) && std::ptr::eq(c1.oy, c2.oy));
+
+        // 2D and 3D thick layouts of the same mode do not collide in the cache.
+        let d2 = Layout::new(9, 2, cfg).unwrap();
+        let d3 = Layout::new_3d(9, 2, cfg).unwrap();
+        assert_eq!(d2.block_d, 1);
+        assert!(d3.block_d > 1);
+        assert!(!std::ptr::eq(d2.ox, d3.ox));
+        let d3_again = Layout::new_3d(9, 2, cfg).unwrap();
+        assert!(std::ptr::eq(d3.ox, d3_again.ox) && std::ptr::eq(d3.oz, d3_again.oz));
+
+        // Invalid lookups return None without inserting entries into the cache.
+        assert!(Layout::new(99, 2, cfg).is_none());
+        assert!(Layout::new(9, 5, cfg).is_none());
+        assert!(Layout::new_3d(10, 2, cfg).is_none());
+        let g = LAYOUT_CACHE.get().unwrap().read().unwrap();
+        assert!(!g.contains_key(&(false, 99, 2, cfg)));
+        assert!(!g.contains_key(&(false, 9, 5, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
+        assert!(!g.contains_key(&(true, 10, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
     }
 }
 

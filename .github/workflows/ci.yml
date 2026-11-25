@@ -2,9 +2,8 @@
 # (each prints "SKIPPED <test>: <reason>", counted at the end of scripts/test.ps1) and the
 # tests on game data pass without running. What it checks on every push and pull request:
 # the workspace builds, the unit / integration tests pass, and the recompiler's HLSL compiles
-# with the runner's DXC (Windows SDK). A second job runs scripts/test-native-stderr.tests.ps1
-# under Windows PowerShell 5.1 and PowerShell 7, which checks that scripts/test.ps1 survives a
-# native Cargo writing to stderr.
+# with the runner's DXC (Windows SDK). A second job checks native Cargo stderr handling
+# and smoke title labels under Windows PowerShell 5.1 and PowerShell 7.
 #
 # Left out: the test title's end-to-end run (`test_title_runs_and_game_folder_is_untouched`).
 # The runner has no System32\xgameruntime.dll (Gaming Services) and only the Microsoft Basic
@@ -69,3 +68,11 @@ jobs:
       - name: test-native-stderr.tests.ps1 (PowerShell 7)
         shell: pwsh
         run: ./scripts/test-native-stderr.tests.ps1
+
+      - name: smoke-title.tests.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/smoke-title.tests.ps1
+
+      - name: smoke-title.tests.ps1 (PowerShell 7)
+        shell: pwsh
+        run: ./scripts/smoke-title.tests.ps1

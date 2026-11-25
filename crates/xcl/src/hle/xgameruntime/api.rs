@@ -11,9 +11,10 @@
 //! dropped), the XGameUi dialogs that do not take a user –, refuses XStore, app broadcast and
 //! app capture (the thunk then returns its "API not available" error), and passes everything
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
-//! same GUIDs) – XTaskQueue / XAsync, XThread, XNetworking, XGameInvite… Once the PC runtime is
-//! in use, the queues and async blocks are its own, so XCL's async APIs run on its XAsync
-//! (`xasync::use_pc`). Nothing that takes an XCL user handle goes to the PC runtime: it does not
+//! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
+//! the PC runtime is in use, the queues and async blocks are its own, so XCL's async APIs run on
+//! its XAsync (`xasync::use_pc`); without `System32\xgameruntime.dll`, XAsync / XTaskQueue /
+//! XThread fall back to XCL's own. Nothing that takes an XCL user handle goes to the PC runtime: it does not
 //! validate foreign handles.
 //!
 //! Layout: `gdk_table` (extracted from the public PC GDK's thunk library) gives every
@@ -138,7 +139,7 @@ fn pc() -> Option<&'static Pc> {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
         let h = LoadLibraryExW(crate::util::wide("xgameruntime.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if h.is_null() {
-            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync and the other APIs XCL does not implement are unavailable");
+            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XCL's own XTaskQueue/XAsync are used; dialogs, text entry, game invites, game streaming and the other APIs XCL does not implement are unavailable");
             return None;
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);
@@ -287,6 +288,11 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
             o
         };
         *out = target as *const Obj as *mut c_void;
+        return S_OK;
+    }
+    if c == XACCESSIBILITY && mute_tts() {
+        note(c, i, "XAccessibility: XCL (XCL_MUTE_TTS=1 – speech synthesis muted)".into());
+        *out = xcl_xaccessibility_object() as *const Obj as *mut c_void;
         return S_OK;
     }
     match pc_object(&c, &i) {
@@ -637,8 +643,21 @@ fn xcl_xasync_object() -> &'static Obj {
     })
 }
 
+fn parse_mute_tts(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let s = v.trim();
+        !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("off") && !s.eq_ignore_ascii_case("false")
+    })
+}
+
+fn mute_tts() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| parse_mute_tts(std::env::var("XCL_MUTE_TTS").ok().as_deref()))
+}
+
 /// Built-in XAccessibility COM object used as a fallback when Gaming Services
-/// (`System32\xgameruntime.dll`) is not installed on the host.
+/// (`System32\xgameruntime.dll`) is not installed on the host, or when `XCL_MUTE_TTS=1`
+/// silences Windows speech synthesis.
 fn xcl_xaccessibility_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
@@ -2052,5 +2071,17 @@ mod tests {
             assert_eq!(hr, S_OK);
             assert!(!queried.is_null());
         }
+    }
+
+    #[test]
+    fn parse_mute_tts_values() {
+        assert!(!parse_mute_tts(None));
+        assert!(!parse_mute_tts(Some("")));
+        assert!(!parse_mute_tts(Some("0")));
+        assert!(!parse_mute_tts(Some("off")));
+        assert!(!parse_mute_tts(Some("false")));
+        assert!(parse_mute_tts(Some("1")));
+        assert!(parse_mute_tts(Some("true")));
+        assert!(parse_mute_tts(Some("yes")));
     }
 }
