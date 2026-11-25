@@ -7,6 +7,7 @@
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
 # -Title prints the given label instead. Use the same one for the main and the PR run.
+# -OutDir also saves the launcher streams in stdout.txt and stderr.txt. Each run replaces both files.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
@@ -65,8 +66,16 @@ if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
 }
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
-$null = $stderrTask.Result
+$stderr = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
+
+if ($OutDir) {
+    if (-not (Test-Path $OutDir)) {
+        $null = New-Item -ItemType Directory -Path $OutDir -Force
+    }
+    Set-Content -LiteralPath (Join-Path $OutDir 'stdout.txt') -Value $stdout -Encoding utf8 -NoNewline
+    Set-Content -LiteralPath (Join-Path $OutDir 'stderr.txt') -Value $stderr -Encoding utf8 -NoNewline
+}
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
@@ -91,9 +100,6 @@ if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { 
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
-    if (-not (Test-Path $OutDir)) {
-        $null = New-Item -ItemType Directory -Path $OutDir -Force
-    }
     Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir 'xcl.log') -Force
     $destReport = Join-Path $OutDir 'report.json'
     if (Test-Path $report) {
