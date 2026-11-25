@@ -44,6 +44,10 @@ try {
     $secondLog = "(3 frames shown, 3 PresentX calls)`n"
     [IO.File]::WriteAllText($log, $secondLog)
     Remove-Item -LiteralPath $report
+    # The launcher reports the log differently when report.json is absent.
+    $notice = Join-Path $fixture 'notice.txt'
+    [IO.File]::WriteAllText($notice, "No report $([char]0x2013) see the log: $log`r`n")
+    [IO.File]::WriteAllText($xcl, "@type `"%~dp0notice.txt`"`r`n")
     $second = & $smoke @common -ArtifactsDir $artifacts -CacheState seeded
     if ($second -notmatch '(?m)^gpu: Fixture fallback GPU\r?$') { throw 'Missing-report fallback failed' }
     $runs = @(Get-ChildItem -LiteralPath $artifacts -Directory)

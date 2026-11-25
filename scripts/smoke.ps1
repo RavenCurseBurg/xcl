@@ -74,9 +74,10 @@ $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
-$logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
-if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
-$log = ($logLine -replace '^Log:\s+', '').Trim()
+$log = $stdout -split "`n" | ForEach-Object {
+    if ($_ -match '^(?:Log|No report \u2013 see the log):\s+(.+)$') { $Matches[1].Trim() }
+} | Select-Object -Last 1
+if (-not $log) { throw "XCL printed no log path; its output:`n$stdout" }
 $text = Get-Content -LiteralPath $log -Raw -Encoding utf8
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
