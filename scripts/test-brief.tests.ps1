@@ -11,6 +11,20 @@ $oldPath = $env:PATH
 $oldLog = $env:XCL_TEST_LOG
 Push-Location
 try {
+    $env:PATH = $fixture
+    $env:XCL_TEST_LOG = $full
+    [IO.File]::WriteAllText($full, 'previous test run')
+    # A broken runner may leave the log open. Let the child close its handles before reading it.
+    & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -Command {
+        param($runnerPath)
+        $ProgressPreference = 'SilentlyContinue'
+        try { & $runnerPath -Brief *> $null }
+        catch [System.Management.Automation.CommandNotFoundException] { exit 0 }
+        exit 1
+    } -Args $runner
+    if ($LASTEXITCODE -ne 0) { throw 'Expected the runner to report missing Cargo.' }
+    if ([IO.File]::ReadAllText($full) -cne 'previous test run') { throw 'Missing Cargo changed the previous log.' }
+
     @'
 @echo off
 if "%1"=="build" (
@@ -37,8 +51,6 @@ if "%1"=="test" (
 )
 exit /b 127
 '@ | Set-Content -LiteralPath $cargo -Encoding Ascii
-    $env:PATH = $fixture
-    $env:XCL_TEST_LOG = $full
     if ((Get-Command cargo).Path -ne $cargo) { throw 'The native Cargo fixture was not selected.' }
 
     & $runner -Brief *> $console
@@ -46,6 +58,7 @@ exit /b 127
     # a redirected Windows PowerShell 5.1 host wraps long lines: compare without the line breaks
     $shown = (Get-Content -LiteralPath $console -Raw) -replace "`r?`n", ''
     $logged = Get-Content -LiteralPath $full -Raw
+    if ($logged.Contains('previous test run')) { throw 'The new run kept output from the previous run.' }
     foreach ($want in "synthetic panic", "GPU tests skipped on this adapter: 1 (synthetic reason)",
         "tests: 3 passed, 1 failed, 4 ignored (2 test binaries); exit 101; full output: $full") {
         if (!$shown.Contains($want)) { throw "Console lacks: $want" }
