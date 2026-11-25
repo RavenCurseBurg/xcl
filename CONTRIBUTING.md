@@ -147,6 +147,14 @@ and pure renames need no test.
 - **Recompiler instructions** get a per-instruction GPU test compared against an expected result,
   like the existing ones.
 - Run the whole suite before opening the PR:
+
+```powershell
+."scripts\test.ps1" --locked        # cargo build --locked --workspace + cargo test --locked --workspace
+```
+
+XCL builds and runs on Windows only. If you could not run the tests (e.g. you work on macOS or Linux), say so in **Not tested**; a PR with no Windows test run waits until someone runs one.
+
+**Locked builds**: When adding a dependency, update `Cargo.lock` before running `scripts/test.ps1` -- it fails with `--locked` if the lockfile is outdated.
   ```powershell
   .\scripts\test.ps1        # cargo build --locked --workspace + cargo test --locked --workspace
   ```
