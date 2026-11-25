@@ -105,6 +105,20 @@ class GenTilingCliTests(unittest.TestCase):
 
 
 class GenTilingGenerateTests(unittest.TestCase):
+    def test_unbraced_pattern_row_is_not_dropped(self):
+        row = '{ 0, 0, 0, 0, 0 },'
+        for replacement in ('not_a_pattern_row,', row + '\n    not_a_pattern_row,\n    ' + row):
+            with self.subTest(replacement=replacement):
+                header = make_synthetic_header().replace(row, replacement, 1)
+                with self.assertRaisesRegex(ValueError, MODES[0][1]):
+                    generate(header)
+
+    def test_braces_inside_comments_are_not_rows(self):
+        row = '{ 0, 0, 0, 0, 0 },'
+        header = make_synthetic_header()
+        commented = header.replace(row, '/* { ignored } */ ' + row + ' // { ignored }', 1)
+        self.assertEqual(generate(commented), generate(header))
+
     def test_value_parsing(self):
         self.assertEqual(value("0"), 0)
         self.assertEqual(value("0x10"), 16)

@@ -47,7 +47,11 @@ def table(name, src):
     m = re.search(r"const\s+(?:\w+\s+)+" + re.escape(name) + r"\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n\};", src, re.S)
     if not m:
         raise ValueError(f"table '{name}' not found in header")
-    rows = re.findall(r"\{([^{}]*)\}", m.group(1))
+    body = re.sub(r"//[^\n]*|/\*.*?\*/", " ", m.group(1), flags=re.S)
+    row = r"\{[^{}]*\}"
+    if not re.fullmatch(rf"\s*{row}(?:\s*,\s*{row})*\s*,?\s*", body):
+        raise ValueError(f"expected comma-separated braced rows in table '{name}'")
+    rows = re.findall(r"\{([^{}]*)\}", body)
     out = []
     for r in rows:
         vals = [value(t) for t in r.split(",")]
