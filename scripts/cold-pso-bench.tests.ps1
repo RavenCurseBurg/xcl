@@ -44,6 +44,9 @@ try {
         }
     }
     if (-not (Test-Path (Join-Path $out 'summary.csv'))) { throw 'no summary.csv' }
+    foreach ($row in (Import-Csv -LiteralPath (Join-Path $out 'summary.csv'))) {
+        if ([long]$row.peak_commit_mb -le 0) { throw "no peak commit for short child at $($row.threads) threads" }
+    }
     # a new exe name for each run (the AMD driver's cache key), none left behind
     if ($names[0] -eq $names[1]) { throw "two runs used one exe name: $($names[0])" }
     $left = @(Get-ChildItem $fixture -Filter 'xcl-cold-*')

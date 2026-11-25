@@ -72,6 +72,38 @@ function Get-Summary($Rows) {
     [pscustomobject]$s
 }
 
+# Windows retains PeakPagefileUsage (peak private commit) on the process handle after exit.
+if (-not ('XclColdPso.MemoryCounters' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace XclColdPso {
+    public static class MemoryCounters {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Counters {
+            public uint Size, PageFaultCount;
+            public UIntPtr PeakWorkingSet, WorkingSet, PeakPagedPool, PagedPool;
+            public UIntPtr PeakNonPagedPool, NonPagedPool, PagefileUsage, PeakPagefileUsage;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool K32GetProcessMemoryInfo(SafeProcessHandle process, ref Counters counters, uint size);
+
+        public static ulong PeakCommit(SafeProcessHandle process) {
+            var counters = new Counters();
+            counters.Size = (uint)Marshal.SizeOf(typeof(Counters));
+            if (!K32GetProcessMemoryInfo(process, ref counters, counters.Size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return counters.PeakPagefileUsage.ToUInt64();
+        }
+    }
+}
+'@
+}
+
 # One `xcl shaders` run with the given environment; wall and CPU time, peak private commit.
 function Invoke-Xcl([string[]]$Arguments, [hashtable]$Environment, [string]$Exe = $Xcl) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -81,15 +113,20 @@ function Invoke-Xcl([string[]]$Arguments, [hashtable]$Environment, [string]$Exe 
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[$k] = [string]$Environment[$k] }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $p = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $p.StandardOutput.ReadToEndAsync(); $stderr = $p.StandardError.ReadToEndAsync()
-    $watch = [Diagnostics.Stopwatch]::StartNew(); $peak = 0L
-    while (-not $p.WaitForExit(1000)) {
-        try { $p.Refresh(); $peak = [math]::Max($peak, $p.PrivateMemorySize64) } catch { }
-        if ($watch.Elapsed.TotalMinutes -gt $TimeoutMinutes) { $p.Kill(); throw "xcl ran over $TimeoutMinutes minutes" }
+    try {
+        $stdout = $p.StandardOutput.ReadToEndAsync(); $stderr = $p.StandardError.ReadToEndAsync()
+        while (-not $p.WaitForExit(1000)) {
+            if ($watch.Elapsed.TotalMinutes -gt $TimeoutMinutes) { $p.Kill(); throw "xcl ran over $TimeoutMinutes minutes" }
+        }
+        $p.WaitForExit()
+        $wall = $p.ExitTime.ToUniversalTime() - $p.StartTime.ToUniversalTime()
+        $peak = [XclColdPso.MemoryCounters]::PeakCommit($p.SafeHandle)
+        [pscustomobject]@{ Exit = $p.ExitCode; WallS = [math]::Round($wall.TotalSeconds, 1); CpuS = [math]::Round($p.TotalProcessorTime.TotalSeconds, 1); PeakMB = [math]::Round($peak / 1MB); Out = $stdout.Result + $stderr.Result }
+    } finally {
+        $p.Dispose()
     }
-    $p.WaitForExit()
-    [pscustomobject]@{ Exit = $p.ExitCode; WallS = [math]::Round($watch.Elapsed.TotalSeconds, 1); CpuS = [math]::Round($p.TotalProcessorTime.TotalSeconds, 1); PeakMB = [math]::Round($peak / 1MB); Out = $stdout.Result + $stderr.Result }
 }
 
 $common = @('shaders', $Shaders, '--precompile', '--only', 'cs')
