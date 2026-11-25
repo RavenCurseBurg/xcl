@@ -87,7 +87,8 @@ $draws = [regex]::Matches($text, 'activity \(2 s\): \d+ presents, \d+ submits, (
 $lastDraws = if ($draws) { ($draws | Select-Object -Last 3) -join ' ' } else { 'n/a' }
 $d = if ($rep) { $rep.d3d12 } else { $null }
 $translated = if ($d) { $d.translated_pipelines } else { 'n/a' }
-$refused = if ($d -and $d.translation_errors) { @($d.translation_errors).Count } else { 0 }
+# The report retains up to 40 distinct reasons, with no occurrence count.
+$reasonCount = if ($d -and $d.translation_errors -is [array]) { $d.translation_errors.Count } else { 'n/a' }
 $fallback = if ($d) { $d.fallback_pipelines } else { 'n/a' }
 $failed = if ($d) { $d.failed_pipelines } else { 'n/a' }
 $vm = [regex]::Matches($text, 'video memory (\d+) MB local, (\d+) MB non-local')
@@ -110,7 +111,7 @@ crashes: $crashes
 peak commit: $peak MB
 video memory peak: $vlocal MB local, $vnon MB non-local
 translated pipelines: $translated
-refused pipelines: $refused
+refusal reasons (max 40): $reasonCount
 fallback pipelines: $fallback
 failed pipelines: $failed
 ``````
