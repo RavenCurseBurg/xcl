@@ -32,7 +32,17 @@ try {
     } catch {
         if ($_.Exception.Message -notmatch 'Candidate log contains no two-second activity samples') { throw }
     }
-    'compare-perf: both fixture checks passed'
+    # A writer may still own the file. Read an unterminated UTF-16 sample through a relative path.
+    $sample = '[    2.500][5][INFO ] activity (2 s): 6 presents, 1 submits; DirectStorage 4 requests, 0 MB, 0 failed'
+    [IO.File]::WriteAllText($base, $sample, [Text.Encoding]::Unicode)
+    $writer = [IO.File]::Open($base, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        Push-Location -LiteralPath $fixture
+        try { $output = & $script -Baseline 'base[1].log' -Candidate 'base[1].log' | Out-String -Width 240 }
+        finally { Pop-Location }
+    } finally { $writer.Dispose() }
+    if ($output -notmatch '(?m)^\s*1\s+2\.500\s+2\.500\s+6\s+6\s+4\s+4\s*$') { throw $output }
+    'compare-perf: all three fixture checks passed'
 } finally {
     Remove-Item -LiteralPath $base, $candidate -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixture

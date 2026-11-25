@@ -10,19 +10,27 @@ function Read-PerformanceLog($Path, $Label) {
     $samples = [System.Collections.Generic.List[object]]::new()
     # XCL logs one activity line per interval, followed by its memory sample.
     $timestamp = '^\[\s*(?<seconds>[0-9]+\.[0-9]+)\]'
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match ($timestamp + '.*?present: first game frame shown \(')) {
-            if ($null -eq $firstFrame) { $firstFrame = $Matches.seconds }
-        } elseif ($line -match ($timestamp + '.*?activity \(2 s\): (?<presents>\d+) presents,.*?; DirectStorage (?<requests>\d+) requests,')) {
-            $samples.Add([pscustomobject]@{
-                End = $Matches.seconds
-                Presents = [long]$Matches.presents
-                Requests = [long]$Matches.requests
-                Commit = $null
-            })
-        } elseif ($samples.Count -gt 0 -and $line -match 'memory: (?<commit>\d+) MB committed by the process;') {
-            $samples[$samples.Count - 1].Commit = [long]$Matches.commit
+    $file = Convert-Path -LiteralPath $Path
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line -match ($timestamp + '.*?present: first game frame shown \(')) {
+                if ($null -eq $firstFrame) { $firstFrame = $Matches.seconds }
+            } elseif ($line -match ($timestamp + '.*?activity \(2 s\): (?<presents>\d+) presents,.*?; DirectStorage (?<requests>\d+) requests,')) {
+                $samples.Add([pscustomobject]@{
+                    End = $Matches.seconds
+                    Presents = [long]$Matches.presents
+                    Requests = [long]$Matches.requests
+                    Commit = $null
+                })
+            } elseif ($samples.Count -gt 0 -and $line -match 'memory: (?<commit>\d+) MB committed by the process;') {
+                $samples[$samples.Count - 1].Commit = [long]$Matches.commit
+            }
         }
+    } finally {
+        $reader.Dispose()
     }
     if ($samples.Count -eq 0) {
         throw "$Label log contains no two-second activity samples. Run XCL with XCL_ACTIVITY=1."
