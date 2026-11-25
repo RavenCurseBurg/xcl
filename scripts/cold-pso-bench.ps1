@@ -126,7 +126,7 @@ if (Test-Path -LiteralPath $summaryPath -PathType Leaf) { Remove-Item -LiteralPa
 $results = @()
 foreach ($n in $Threads) {
     $times = Join-Path $Out "times-$n.csv"
-    Remove-Item -LiteralPath $times -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $times -PathType Leaf) { Remove-Item -LiteralPath $times }
     $vars = @{ XCL_DXIL_CACHE = $dxil; XCL_PSO_DISK_CACHE = '0'; XCL_PIPELINE_THREADS = "$n"; XCL_PIPELINE_TIMES = $times }
     if ($ClearNvCache) {
         $nv = Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'

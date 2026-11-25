@@ -174,6 +174,21 @@ try {
         throw 'failed preparation changed the previous summary or timings'
     }
     'failed preparation preserves previous results: ok'
+    # A reader denying delete still allows old timings to be read. A new summary must not use them.
+    [IO.File]::WriteAllText($xcl, "@echo off`r`nexit /b 0`r`n")
+    $reader = [IO.File]::Open($timing, 'Open', 'Read', 'Read')
+    try {
+        $failed = $false
+        try { & $bench -Shaders 'D:\pack' -Threads 1 -Xcl $xcl -Out $caseOut *> $null }
+        catch { $failed = $true }
+        if (-not $failed -or (Test-Path -LiteralPath $summary)) {
+            throw 'published old timings while the timing file could not be removed'
+        }
+        if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($timing)) -ne $previousTiming) {
+            throw 'changed timings held by another reader'
+        }
+    } finally { $reader.Dispose() }
+    'locked timings cannot produce a new summary: ok'
     'cold-pso-bench.ps1: ok'
 } finally {
     $env:LOCALAPPDATA = $savedAppData
