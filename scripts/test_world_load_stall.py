@@ -82,6 +82,24 @@ class StallSummaryTests(unittest.TestCase):
         report = summarize([activity(2, 0), activity(4, 0)])
         self.assertIn("Activity samples contain no presents", report)
 
+    def test_events_at_sample_boundaries(self):
+        bridge = "D3D12.X: Wait64BitValueX at 0x1 >= 0x2 bridged to GPU queue.Wait (test)"
+        release = "D3D12.X: GPU queue.Wait at 0x1 >= 0x2 released on CPU to prevent GPU hang"
+        report = summarize([
+            activity(8, 1), activity(10, 0), activity(12, 0),
+            compile_start(7, 1), compile_finish(8, 1),  # ends as the window opens
+            compile_start(12, 2),  # starts as the window closes
+            compile_finish(10, 3), compile_start(8, 3),  # written out of time order
+            compile_start(10, 4),  # touches the previous finish, still open
+            log(8, bridge), log(12, bridge),
+            log(8, release), log(12, release), log(12.001, release),
+        ])
+        self.assertIn("Logged driver compiles overlapping the window: 2 (0 began earlier)", report)
+        self.assertIn("Matched driver compile overlap: 2.000 s", report)
+        self.assertIn("Possible overlap including 1 start without a logged finish: 4.000 s", report)
+        self.assertIn("Logged wait-before-signal bridges: 1 (first at 12.000 s)", report)
+        self.assertIn("Logged GPU wait watchdog releases: 1 (first at 12.000 s)", report)
+
     def test_earlier_pause_ends_when_presents_resume(self):
         report = summarize([
             activity(2, 33),
