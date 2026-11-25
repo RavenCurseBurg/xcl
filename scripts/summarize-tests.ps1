@@ -7,7 +7,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $file = Get-Item -LiteralPath $LiteralPath
 if ($file.PSIsContainer) { throw 'Expected a test log file, not a directory.' }
-$totals = @{ Passed = 0L; Failed = 0L; Ignored = 0L; Suites = 0; Started = 0 }
+$totals = @{ Passed = 0L; Failed = 0L; Ignored = 0L; Suites = 0 }
+$pendingSuites = 0
 $skips = [Collections.Generic.List[object]]::new()
 $failed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $missing = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -16,12 +17,13 @@ $reader = [IO.StreamReader]::new($file.FullName)
 try {
     while ($null -ne ($line = $reader.ReadLine())) {
         $line = $line -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
-        if ($line -match '^running \d+ tests?$') { $totals.Started++ }
+        if ($line -match '^running \d+ tests?$') { $pendingSuites++ }
         if ($line -match '^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;') {
             $totals.Passed += [long]$Matches[1]
             $totals.Failed += [long]$Matches[2]
             $totals.Ignored += [long]$Matches[3]
             $totals.Suites++
+            if ($pendingSuites -gt 0) { $pendingSuites-- }
         }
         if ($line -match '^(?:test \S+ \.\.\. )?SKIPPED (\S+): (.+)$') {
             $skips.Add([pscustomobject]@{ Test = $Matches[1]; Reason = $Matches[2] })
@@ -42,7 +44,7 @@ $notes = @(
     'Passed counts may include skipped checks. Skip records are reported separately, not subtracted.',
     'The original process exit code and whole-run completion cannot be established from these summaries.'
 )
-if ($totals.Started -gt $totals.Suites) { $notes += 'More suite starts than results were found; the log may be incomplete.' }
+if ($pendingSuites -gt 0) { $notes += 'A suite start has no matching result; the log may be incomplete.' }
 $report = [pscustomobject][ordered]@{
     source = $file.FullName
     completed_suites = $totals.Suites

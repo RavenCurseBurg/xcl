@@ -47,6 +47,14 @@ diagnostic: test result: ok. 999 passed; 0 failed; 0 ignored;
     $r = Read-Report $log
     if ($r.completed_suites -ne 2 -or $r.notes[-1] -notlike '*incomplete*') { throw 'Missed incomplete suite.' }
     Write-Host 'PASS incomplete log'
+    # A capture can start at one suite's result and end while the next suite is running.
+    $partial = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;`nrunning 1 test"
+    [IO.File]::WriteAllText($log, $partial, [Text.Encoding]::UTF8)
+    $r = Read-Report $log
+    if ($r.completed_suites -ne 1 -or $r.passed -ne 2 -or $r.notes[-1] -notlike '*incomplete*') {
+        throw 'An earlier summary masked a later unfinished suite.'
+    }
+    Write-Host 'PASS incomplete capture starting at a summary'
     [IO.File]::WriteAllText($log, 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;', [Text.Encoding]::UTF8)
     $r = Read-Report $log
     if ($r.completed_suites -ne 1 -or $r.skip_records.Count -ne 0 -or $r.failed_tests.Count -ne 0) { throw 'Empty arrays or suite were lost.' }
