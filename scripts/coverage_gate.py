@@ -76,6 +76,9 @@ def main(argv=None):
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
         proc = subprocess.run(sweep_command(args.xcl, args.rpf, args.threads), capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"sweep exited with code {proc.returncode}\n{proc.stderr[-2000:]}", file=sys.stderr)
+            return 2
         try:
             run = sweep_json(proc.stdout)
         except ValueError as e:
