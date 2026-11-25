@@ -45,3 +45,4 @@ if ($env:XCL_DXC_DIR) {
 }
 
 & $XclExe shaders $GamePath --precompile --pipelines $ExtraArgs
+exit $LASTEXITCODE
