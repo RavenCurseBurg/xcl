@@ -284,6 +284,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   switch, XCL logs only huge driver compiles. The wait-before-signal bridge messages are capped.
   The samples give a time window for investigation. Confirm the visible scene separately, and
   use thread or queue diagnostics to determine what the title was waiting on.
+  If the log includes dumps from `XCL_THREAD_DUMP_AT`, add `--title-exe MyTitle.exe` to inspect the
+  latest dump after the last positive sample through the closing zero-present sample. The report
+  lists thread IDs and visible `xcl.exe` offsets above their first title frame. Use those sampled
+  candidates to investigate the pause. A short unwind can hide the title frame or XCL callers.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated

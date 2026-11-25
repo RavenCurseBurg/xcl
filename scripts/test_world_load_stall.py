@@ -30,6 +30,11 @@ def compile_finish(time, number):
     )
 
 
+def thread_dump(time, *rows, count=None):
+    count = len(rows) if count is None else count
+    return [log(time, f"thread dump ({count} threads):"), *(row + "\r\n" for row in rows)]
+
+
 class StallSummaryTests(unittest.TestCase):
     def test_correlates_and_merges_compiles_across_the_window(self):
         report = summarize([
@@ -93,6 +98,64 @@ class StallSummaryTests(unittest.TestCase):
     def test_no_activity_samples(self):
         report = summarize(["not a runtime log", compile_start(4, 1)])
         self.assertIn("No activity samples found. Capture with XCL_ACTIVITY=1.", report)
+
+    def test_latest_dump_including_closing_sample_matches_windows_module_names(self):
+        lines = [
+            activity(8, 50),
+            activity(10, 0),
+            *thread_dump(12, "thread 42 'worker's caller': dxgi.dll+0x1 < XCL.EXE+0xA "
+                         "< xcl.exe+0xb < … 19 frames … < GAME.EXE+0xc < xcl.exe+0xd",
+                         "thread 43 '': game.exe+0x1 < xcl.exe+0xe",
+                         "thread 44 '': " + " < ".join(["xcl.exe+0xf"] * 14),
+                         "thread 45 '': xcl.exe+0x2 < game.exe+0x3"),
+            *thread_dump(11, "thread 21 '': xcl.exe+0x11 < game.exe+0x12"),
+            activity(12, 0),
+        ]
+        report = summarize(lines, title_exe="Game.exe")
+        self.assertIn("Thread dump at 12.000 s: 4/4 thread lines parsed, 3 with a visible title frame", report)
+        self.assertIn("Sampled title-thread candidates: 2", report)
+        self.assertIn("Thread 42: 0xa < 0xb\n", report)
+        self.assertTrue(report.endswith("Thread 45: 0x2"))
+        self.assertNotIn("Thread 21", report)
+        self.assertEqual(summarize(lines), summarize([activity(8, 50), activity(10, 0), activity(12, 0)]))
+
+    def test_ignores_dumps_at_opening_sample_outside_window_and_after_shutdown(self):
+        report = summarize([
+            activity(8, 50),
+            *thread_dump(8),
+            activity(10, 0),
+            *thread_dump(10.5),
+            log(11, "XCL_RUN_SECONDS: 11 s – ending the title (50 frames shown, 50 PresentX calls)"),
+            *thread_dump(11.5),
+            activity(12, 0),
+        ], title_exe="game.exe")
+        self.assertIn("No timestamped thread dump in the sampled window.", report)
+
+    def test_latest_partial_dump_reports_coverage(self):
+        report = summarize([
+            activity(8, 50),
+            *thread_dump(9),
+            *thread_dump(10, "thread 60 '': game.exe+0x10", count=2),
+            activity(10, 0),
+            "thread 61 '': xcl.exe+0x62 < game.exe+0x63\n",
+        ], title_exe="game.exe")
+        self.assertIn("1/2 thread lines parsed, 1 with a visible title frame (incomplete dump)", report)
+        self.assertIn("Sampled title-thread candidates: 0", report)
+
+    def test_zero_thread_dump_is_a_valid_sample(self):
+        report = summarize([activity(8, 50), *thread_dump(9), activity(10, 0)], title_exe="game.exe")
+        self.assertIn("Thread dump at 9.000 s: 0/0 thread lines parsed, 0 with a visible title frame", report)
+        self.assertTrue(report.endswith("Sampled title-thread candidates: 0"))
+
+    def test_unterminated_last_thread_row_is_incomplete(self):
+        report = summarize([
+            activity(8, 50),
+            activity(10, 0),
+            log(10, "thread dump (1 threads):"),
+            "thread 61 '': xcl.exe+0x1 < game.exe+0x2",
+        ], title_exe="game.exe")
+        self.assertIn("0/1 thread lines parsed, 0 with a visible title frame (incomplete dump)", report)
+        self.assertTrue(report.endswith("Sampled title-thread candidates: 0"))
 
 
 if __name__ == "__main__":

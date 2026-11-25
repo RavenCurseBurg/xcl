@@ -14,6 +14,9 @@ ACTIVITY = re.compile(
 )
 COMPILE_START = re.compile(r"D3D12\.X: driver compile start #(\d+): (.+?) PSO, (\d+) B DXIL")
 COMPILE_FINISH = re.compile(r"D3D12\.X: driver compile finish #(\d+): ")
+THREAD_DUMP = re.compile(r"thread dump \((\d+) threads\):")
+THREAD_ROW = re.compile(r"thread (\d+) '.*': (.*)")
+MODULE_FRAME = re.compile(r"(.+)\+(0x[0-9a-f]+)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -48,20 +51,73 @@ def event_count(times, start, end):
     return f"{len(in_window)} (first at {min(in_window):.3f} s)" if in_window else "0"
 
 
-def summarize(lines):
+def thread_dump_report(dumps, start, end, title_exe):
+    latest = max(
+        (dump for dump in reversed(dumps) if start < dump[0] <= end),
+        key=lambda dump: dump[0],
+        default=None,
+    )
+    if latest is None:
+        return ["No timestamped thread dump in the sampled window."]
+
+    time, expected, rows = latest
+    title_exe = title_exe.casefold()
+    visible_title = 0
+    candidates = []
+    for thread_id, stack in rows:
+        offsets = []
+        for entry in stack.split(" < "):
+            frame = MODULE_FRAME.fullmatch(entry)
+            if not frame:
+                continue
+            module, offset = frame.groups()
+            module = module.casefold()
+            if module == title_exe:
+                visible_title += 1
+                if offsets:
+                    candidates.append(f"  Thread {thread_id}: {' < '.join(offsets)}")
+                break
+            if module == "xcl.exe":
+                offsets.append(offset.lower())
+
+    completeness = " (incomplete dump)" if len(rows) < expected else ""
+    return [
+        f"Thread dump at {time:.3f} s: {len(rows)}/{expected} thread lines parsed, "
+        f"{visible_title} with a visible title frame{completeness}",
+        f"Sampled title-thread candidates: {len(candidates)}",
+        *candidates,
+    ]
+
+
+def summarize(lines, *, title_exe=None):
     samples = []
     starts = {}
     finishes = {}
     bridges = []
     releases = []
+    dumps = []
+    dump_rows = None
     stop = float("inf")
     for line in lines:
         match = LOG_LINE.match(line)
         if not match:
+            # The logger writes a dump header and its unprefixed rows as one record.
+            if dump_rows is not None:
+                row = THREAD_ROW.fullmatch(line.rstrip("\r\n")) if line.endswith("\n") else None
+                if row:
+                    dump_rows.append(row.groups())
+                if not row or len(dump_rows) == dumps[-1][1]:
+                    dump_rows = None
             continue
+        dump_rows = None
         time = float(match[1])
         message = match[2]
-        if activity := ACTIVITY.match(message):
+        if title_exe is not None and (header := THREAD_DUMP.fullmatch(message.rstrip("\r"))):
+            expected = int(header[1])
+            rows = []
+            dumps.append((time, expected, rows))
+            dump_rows = rows if expected else None
+        elif activity := ACTIVITY.match(message):
             samples.append(Activity(time, *map(int, activity.groups())))
         elif compile_start := COMPILE_START.match(message):
             starts[int(compile_start[1])] = Compile(time, compile_start[2], int(compile_start[3]))
@@ -129,16 +185,21 @@ def summarize(lines):
         f"Logged wait-before-signal bridges: {event_count(bridges, start, end)}",
         f"Logged GPU wait watchdog releases: {event_count(releases, start, end)}",
     ])
+    if title_exe is not None:
+        report.extend(thread_dump_report(dumps, start, end, title_exe))
     return "\n".join(report)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path, help="path to one saved xcl.log")
+    parser.add_argument("--title-exe", metavar="NAME", help="title executable basename for thread dump analysis")
     args = parser.parse_args()
+    if args.title_exe is not None and not re.fullmatch(r"[^\\/:\r\n]+\.exe", args.title_exe, re.IGNORECASE):
+        parser.error("--title-exe requires an executable basename")
     try:
         with args.log.open(encoding="utf-8-sig", errors="replace") as log:
-            print(summarize(log))
+            print(summarize(log, title_exe=args.title_exe))
     except OSError as error:
         parser.error(str(error))
 
