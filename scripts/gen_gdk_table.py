@@ -47,7 +47,12 @@ def main(argv=None):
         return 1
 
     out_path = args[1] if len(args) > 1 else DEFAULT_OUT
-    src = io.open(table_path, encoding='utf-8').read()
+    try:
+        with io.open(table_path, encoding='utf-8') as table:
+            src = table.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"error: cannot read '{table_path}': {exc}", file=sys.stderr)
+        return 1
     try:
         content, rows = generate(src)
     except ValueError:
@@ -55,10 +60,13 @@ def main(argv=None):
         return 1
 
     out_dir = os.path.dirname(os.path.abspath(out_path))
-    if out_dir:
+    try:
         os.makedirs(out_dir, exist_ok=True)
-    with io.open(out_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(content)
+        with io.open(out_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(content)
+    except OSError as exc:
+        print(f"error: cannot write '{out_path}': {exc}", file=sys.stderr)
+        return 1
 
     print(len(rows), 'rows ->', os.path.normpath(out_path))
     return 0

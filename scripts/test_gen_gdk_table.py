@@ -62,6 +62,33 @@ class GenGdkTableCliTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1)
             self.assertIn("error: no GDK API rows found", res.stderr)
 
+    def test_invalid_utf8_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / 'input.txt'
+            table.write_bytes(b'\xff')
+            out = Path(tmp) / 'out.rs'
+            out.write_bytes(b'previous output')
+            result = subprocess.run([sys.executable, '-B', str(SCRIPT), str(table), str(out)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('error: cannot read', result.stderr)
+            self.assertIn(str(table), result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+            self.assertEqual(out.read_bytes(), b'previous output')
+
+    def test_unwritable_output_reports_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / 'input.txt'
+            table.write_text(SAMPLE_INPUT, encoding='utf-8')
+            for out in (Path(tmp), table / 'child.rs'):
+                with self.subTest(out=out):
+                    result = subprocess.run([sys.executable, '-B', str(SCRIPT), str(table), str(out)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('error: cannot write', result.stderr)
+                    self.assertIn(str(out), result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+
     def test_cli_custom_output_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             src_file = Path(tmp) / "input.txt"
