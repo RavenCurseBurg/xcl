@@ -70,10 +70,12 @@ class BannedModelTests(unittest.TestCase):
 
 
 class SmokeBlockTests(unittest.TestCase):
+    RUN = ("title: G\nseconds: 60\nexit: 0x0\nframes shown: 100\n"
+           "device removals: 0\ncrashes: 0\npeak commit: 1000 MB\n")
+
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
-        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"
-                "xcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + self.RUN + "\n"
+                "xcl-smoke v1\ncommit: 1234567890\n" + self.RUN + "```\n")
         blocks = smoke_blocks(body)
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in blocks])
         files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
@@ -97,10 +99,34 @@ class SmokeBlockTests(unittest.TestCase):
                 self.assertTrue(any(p.startswith(run) and f"no `{field}` line" in p for p in problems), problems)
 
     def test_non_numeric_frames_shown_fails(self):
-        run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
+        run = self.RUN.replace("frames shown: 100\n", "")
         problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
+
+    def test_pr_block_requires_safety_fields(self):
+        for field in ("device removals", "crashes", "exit", "peak commit"):
+            with self.subTest(field=field):
+                pr_run = "\n".join(line for line in self.RUN.splitlines()
+                                   if not line.startswith(field + ":")) + "\n"
+                problems = self.smoke_problems(self.RUN, pr_run)
+                self.assertTrue(any(p.startswith("the PR's") and f"no `{field}` line" in p
+                                    for p in problems), problems)
+
+    def test_pr_block_rejects_invalid_safety_values(self):
+        cases = {
+            "device removals: none": "non-numeric `device removals`",
+            "crashes: none": "non-numeric `crashes`",
+            "exit: 0xc0000005": "exited with 0xc0000005, not 0x0",
+            "peak commit: n/a MB": "non-numeric `peak commit`",
+        }
+        for replacement, expected in cases.items():
+            with self.subTest(replacement=replacement):
+                field = replacement.split(":", 1)[0]
+                pr_run = "\n".join(replacement if line.startswith(field + ":") else line
+                                   for line in self.RUN.splitlines()) + "\n"
+                problems = self.smoke_problems(self.RUN, pr_run)
+                self.assertTrue(any(expected in p for p in problems), problems)
 
 
 class TemplatePlaceholderTests(unittest.TestCase):
