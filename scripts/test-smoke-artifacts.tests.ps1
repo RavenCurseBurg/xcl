@@ -34,8 +34,8 @@ echo Log: $mockLog
 exit /b 0
 "@ | Set-Content -LiteralPath $mockXcl -Encoding Ascii
 
-    # Run 1: with report.json present
-    $output1 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir1 -Title 'MockRun1'
+    # Run 1: with report.json present and the original positional OutDir argument
+    $output1 = & $runner $gameDir 5 $mockXcl 'MockRun1' $outDir1
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 1" }
 
     if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 1 did not preserve xcl.log' }
