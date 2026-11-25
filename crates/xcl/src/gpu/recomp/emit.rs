@@ -17,6 +17,8 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
+    /// whole-wave reductions (`wave32_reductions`)
+    pub reductions: super::Reductions,
     opt: Options,
     out: String,
     pub indent: usize,
@@ -31,8 +33,12 @@ pub(super) struct Em {
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
     pub ps_modes: BTreeMap<u32, String>,
-    /// PS: an export with DONE was emitted (lanes without it are discarded)
+    /// PS: an export controlling pixel survival (VM=1, or DONE=1 fallback) was emitted
     ps_done: bool,
+    /// PS: program has at least one EXP with VM=1 (pixel survival follows VM rather than DONE)
+    has_ps_vm: bool,
+    /// PS: an exp mrtz wrote the sample mask (declare and default-init SV_Coverage)
+    ps_writes_mask: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
@@ -40,9 +46,10 @@ pub(super) struct Em {
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
-    /// split wave64: pc → SGPRs whose whole value may be read after that instruction
-    /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
-    pub x64_whole_live: BTreeMap<u64, u128>,
+    /// split wave64 and pixel shaders: pc → SGPRs whose whole value may be read after that
+    /// instruction (`x64_masks`); a mask written to none of them is only read lane by lane
+    /// (split: stays in its half, no exchange; pixel: no quad reads for the helper lanes)
+    pub mask_whole_live: BTreeMap<u64, u128>,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -60,6 +67,35 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
+    track_frexp_denorm: bool,
+    /// multi-warp Compute/Mesh shader containing `s_barrier`: use early-exit-safe, bounded
+    /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
+    /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
+    safe_barrier: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
+    img_writes: Vec<u64>,
+    /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
+    pub coherent_mem: bool,
+}
+
+/// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
+/// image_load reads through the UAV (`tw0 + 1`) where the invocation stored to the same image
+/// before (`xcl_iw{srsrc}` holds `tw0 + 1` of the last such store): the SRV need not see a
+/// write of the same dispatch, and RDNA reads its own writes.
+pub fn image_write_srsrcs(insts: &[Decoded]) -> Vec<u64> {
+    let mut v: Vec<u64> = insts
+        .iter()
+        .filter(|d| d.enc.name.starts_with("ENC_MIMG"))
+        .filter(|d| {
+            let n = d.inst.name.to_ascii_lowercase();
+            n.starts_with("image_store") || n.starts_with("image_atomic")
+        })
+        .map(|d| rdna2::field_value(d.enc, &d.words, "SRSRC").unwrap_or(0) * rdna2::register_scale("SRSRC"))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(16);
+    v
 }
 
 /// Instructions without an effect in this execution model.
@@ -158,6 +194,81 @@ fn float_compare(op: &str, a: &str, b: &str, isnan: &str) -> Option<String> {
             None => format!("and(!{nan}, {})", rel(op)?),
         },
     })
+}
+
+/// A pixel shader's mask (#134): the quad's four bits (bit p: member p's
+/// `act` and `cond`) for `ballot_px_quad`, every lane evaluating each member's condition with
+/// that member's vector registers read through quad reads. `ballot_px` quad-reads the compare's
+/// result instead, and AMD's RDNA2 compiler crashed in `CreateGraphicsPipelineState` on quad
+/// reads of a value computed from a `WaveReadLaneAt` in a loop – the shape that gives every
+/// `v_cmp` of a waterfall loop over `v_readfirstlane` (WarmMilkCodes on an RX 6600 XT, driver
+/// 32.0.21045.29003: the loop's `ballot_px` replaced by `ballot` builds; `rla`'s quad reads of
+/// the loop's vector operand did not crash it), and AMD's RDNA3 compiler on a `WaveReadLaneAt`
+/// whose lane came from such a mask, with no loop (`s_ff1` of it → `v_readlane`; srcamarda on
+/// an RX 7800 XT). The same bits as `ballot_px` as long as the
+/// other terms are the same in every lane of a quad, which is all this accepts: scalar
+/// registers, constants, pure functions and `lane_id` (rewritten per member). Anything else (a
+/// temporary, a lane read, a derivative) gives `None`, and the mask keeps `ballot_px`. Returns
+/// the quad reads (one per vector register and member, into `{tmp}_vN_p`) and the bits.
+fn quad_bits(act: &str, cond: &str, tmp: &str) -> Option<(String, String)> {
+    let mut reads = std::collections::BTreeSet::new();
+    let mut terms = Vec::with_capacity(4);
+    for p in 0..4u32 {
+        // the wave64 EXEC bit (`lanebit` reads `lane_id` inside); the wave32 one names it
+        let a = if act == "lanebit(exec_lo, exec_hi)" { format!("lanebit_at(exec_lo, exec_hi, (lane_id & ~3u) | {p}u)") } else { quad_member(act, p, tmp, &mut reads)? };
+        let c = quad_member(cond, p, tmp, &mut reads)?;
+        terms.push(if p == 0 { format!("(uint)and({a}, ({c}))") } else { format!("((uint)and({a}, ({c})) << {p}u)") });
+    }
+    let reads: Vec<String> = reads.iter().map(|(v, p)| format!("uint {tmp}_{v}_{p} = QuadReadLaneAt({v}, {p}u);")).collect();
+    Some((reads.join(" "), terms.join(" | ")))
+}
+
+/// `expr` as member `p` of the lane's quad evaluates it (`quad_bits`): vector registers through
+/// `QuadReadLaneAt` (`{tmp}_vN_p`, noted in `reads`), `lane_id` as the member's; `None` for a
+/// term that may differ between the lanes of a quad in another way.
+fn quad_member(expr: &str, p: u32, tmp: &str, reads: &mut std::collections::BTreeSet<(String, u32)>) -> Option<String> {
+    const PURE: &[&str] = &[
+        "asfloat", "asuint", "asint", "asdouble", "isnan", "isnan_d", "isinf", "isfinite", "and", "or", "select", "abs", "min", "max",
+        "fclass", "fclass16", "fclass64", "f16tof32", "f32tof16", "sdwa_sel", "firstbitlow", "firstbithigh", "countbits", "reversebits",
+        "mul_hi_u32", "uint", "int", "float", "double",
+    ];
+    const SAME: &[&str] = &["vcc_lo", "vcc_hi", "exec_lo", "exec_hi", "m0", "scc", "true", "false", "uint", "int", "float", "bool", "double", "uint64_t", "int64_t"];
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() * 2);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_digit() {
+            // a literal (0x3F800000u, 1.0f, 1e-3f), copied as it is
+            let s = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || ((b[i] == b'-' || b[i] == b'+') && matches!(b[i - 1], b'e' | b'E') && !expr[s..].starts_with("0x"))) {
+                i += 1;
+            }
+            out.push_str(&expr[s..i]);
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let s = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let id = &expr[s..i];
+            let call = expr[i..].trim_start().starts_with('(');
+            let reg = |prefix: &str| id.strip_prefix(prefix).is_some_and(|n| !n.is_empty() && n.bytes().all(|d| d.is_ascii_digit()));
+            if reg("v") {
+                out.push_str(&format!("{tmp}_{id}_{p}"));
+                reads.insert((id.to_string(), p));
+            } else if id == "lane_id" {
+                out.push_str(&format!("((lane_id & ~3u) | {p}u)"));
+            } else if reg("s") || reg("ttmp") || (call && PURE.contains(&id)) || (!call && SAME.contains(&id)) {
+                out.push_str(id);
+            } else {
+                return None;
+            }
+        } else {
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Layout of the SDWA / DPP extension dword for this instruction's base encoding.
@@ -362,6 +473,28 @@ fn decode_hwreg(simm16: u16) -> (u32, u32, u32) {
     (id, offset, width)
 }
 
+/// Source bit that a `s_setreg*` field writes to MODE[4] (FP32 denormal input preserve).
+fn frexp_f32_denorm_shift(simm16: u16) -> Option<u32> {
+    let (id, offset, width) = decode_hwreg(simm16);
+    (id == 1 && (offset..offset + width).contains(&4)).then(|| 4 - offset)
+}
+
+pub(crate) fn writes_frexp_f32_denorm(d: &Decoded) -> bool {
+    match d.inst.name {
+        "S_DENORM_MODE" => true,
+        "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
+            let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+            frexp_f32_denorm_shift(simm).is_some()
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn tracks_frexp_f32_denorm(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| d.inst.name == "V_FREXP_EXP_I32_F32")
+        && insts.iter().any(writes_frexp_f32_denorm)
+}
+
 /// Bits of `MODE[1:0]` (sp) and `MODE[3:2]` (dp/f16) touched by a `s_setreg*` `SIMM16`.
 /// Returns `(sp_mask, dp_mask)` (each 2 bits) and `offset`. Non-`MODE` registers return `(0, 0, 0)`.
 fn hwreg_mode_round_masks(simm16: u16) -> (u32, u32, u32) {
@@ -413,6 +546,7 @@ fn is_f16_rounded_op(name: &str) -> bool {
             | "v_max3_f16"
             | "v_frexp_mant_f16"
             | "v_mad_f16"
+            | "v_div_fixup_f16"
             | "v_fmac_f16"
             | "v_fmamk_f16"
             | "v_fmaak_f16"
@@ -462,6 +596,7 @@ impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
             opt,
+            reductions: Default::default(),
             out: String::new(),
             indent: 1,
             sgprs: BTreeSet::new(),
@@ -473,10 +608,12 @@ impl Em {
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
             ps_done: false,
+            has_ps_vm: false,
+            ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
-            x64_whole_live: BTreeMap::new(),
+            mask_whole_live: BTreeMap::new(),
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -485,18 +622,41 @@ impl Em {
             has_f16_round_op: false,
             has_f64_round_op: false,
             dynamic_f16_rm: false,
+            track_frexp_denorm: false,
+            safe_barrier: false,
+            img_writes: Vec::new(),
+            coherent_mem: false,
         }
     }
 
-    /// Pre-scan the program for f16/f64 rounding-sensitive ops and non-default `MODE[3:2]` writes.
-    /// Shaders that set `MODE[3:2]` without f16/f64 ops pay zero HLSL overhead; shaders that set
-    /// `MODE[3:2]` with f16 ops (and no f64 ops) track `xcl_fp16_rm` dynamically.
+    /// Hardware wave count for Compute / Mesh threadgroups (`None` for other stages).
+    fn compute_or_mesh_hw_waves(&self) -> Option<u32> {
+        let threads = match &self.opt.mode {
+            Mode::Compute(cs) => cs.threads.iter().product::<u32>(),
+            Mode::Mesh(ms) => ms.threads,
+            _ => return None,
+        };
+        let hw_lanes = if self.x64() || !self.opt.wave64 { 32 } else { 64 };
+        Some(threads.div_ceil(hw_lanes).max(1))
+    }
+
+    /// Pre-scan the program for f16/f64 rounding-sensitive ops, non-default `MODE[3:2]` writes,
+    /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
+        self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
+        self.img_writes = image_write_srsrcs(insts);
         let mut writes_nonzero_dp = false;
+        let mut has_s_barrier = false;
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
             if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
                 break;
+            }
+            if name == "s_barrier" {
+                has_s_barrier = true;
+            }
+            if matches!(self.opt.mode, Mode::Pixel(_)) && d.enc.name == "ENC_EXP" && rdna2::field_value(d.enc, &d.words, "VM") == Some(1) {
+                self.has_ps_vm = true;
             }
             if is_f16_rounded_op(&name) {
                 self.has_f16_round_op = true;
@@ -529,6 +689,9 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
+        self.safe_barrier = has_s_barrier
+            && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
+            && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
     }
 
     pub fn take(&mut self) -> String {
@@ -555,10 +718,13 @@ impl Em {
         self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
     }
 
-    /// `ballot` of the program's wave (both halves' words in the split form).
+    /// `ballot` of the program's wave (both halves' words in the split form, the helper lanes'
+    /// bits in a pixel shader).
     fn ballot_fn(&self) -> &'static str {
         if self.x64() {
             "xcl_x_ballot"
+        } else if matches!(self.opt.mode, Mode::Pixel(_)) {
+            "ballot_px"
         } else {
             "ballot"
         }
@@ -801,17 +967,30 @@ impl Em {
         let a = self.act();
         let m = self.t();
         let mut ballot = self.ballot_fn();
-        // no exchange for a mask that is only ever read lane by lane (the half's own word is
-        // enough), that goes nowhere, or that is 0 in every lane anyway
+        // no exchange (split) or quad reads (pixel) for a mask that is only ever read lane by
+        // lane (the half's own word, the lane's own bit are enough), that goes nowhere, or that
+        // is 0 in every lane anyway
         let local = match *dst {
-            Dst::S(n) => n < 126 && self.x64_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
+            Dst::S(n) => n < 126 && self.mask_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
             Dst::Null => true,
             Dst::V(_) => false,
         };
-        if self.x64() && (local || cond == "false") {
-            ballot = "xcl_x_ballot_local";
+        if local || cond == "false" {
+            if self.x64() {
+                ballot = "xcl_x_ballot_local";
+            } else if matches!(self.opt.mode, Mode::Pixel(_)) {
+                ballot = "ballot_px_local";
+            }
         }
-        self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
+        match if ballot == "ballot_px" { quad_bits(a, cond, &m) } else { None } {
+            Some((reads, q)) => {
+                if !reads.is_empty() {
+                    self.line(&reads);
+                }
+                self.line(&format!("uint2 {m} = ballot_px_quad({q});"));
+            }
+            None => self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));")),
+        }
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
         } else {
@@ -828,6 +1007,244 @@ impl Em {
     }
 
     // ---------------------------------------------------------------- one instruction
+
+    /// Emit one basic block's instructions in order; stops at the first non-fallthrough flow.
+    /// In split-wave64 mode, folds cross-half reduction tails (`v_readlane(v, L)` -> `v_op(v, s, v)`
+    /// -> `v_readlane(v, L^32)`, 32-bit and 64-bit `v_add_f64`) into a single `xcl_x_meet()`.
+    pub fn emit_insts(&mut self, block: &[Decoded], end: u64) -> Flow {
+        let mut flow = Flow::Next;
+        let mut i = 0;
+        while i < block.len() {
+            if self.x64() {
+                if let Some(consumed) = self.try_emit_x64_reduction_tail(&block[i..]) {
+                    i += consumed;
+                    continue;
+                }
+            }
+            let next = block.get(i + 1).map(|n| n.pc).unwrap_or(end);
+            flow = self.inst(&block[i], next);
+            if !matches!(flow, Flow::Next) {
+                break;
+            }
+            i += 1;
+        }
+        flow
+    }
+
+    /// If `d` is a plain split-wave64 `v_readlane_b32` reading VGPR `v` at constant lane `0..63`
+    /// that will emit an exchange, returns `(dst, v, lane)`.
+    fn x64_const_readlane(&self, d: &Decoded) -> Option<(Dst, u64, u64)> {
+        if d.variant != Variant::Plain || d.inst.name != "V_READLANE_B32" {
+            return None;
+        }
+        if self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).is_some() {
+            return None;
+        }
+        let src0 = rdna2::field_value(d.enc, &d.words, "SRC0")?;
+        let v = src0.checked_sub(256)?;
+        let src1 = rdna2::field_value(d.enc, &d.words, "SRC1")?;
+        let lane = match src1 {
+            128..=192 => src1 - 128,
+            255 => d.literal? as u64,
+            _ => return None,
+        };
+        let (outs, _) = Self::ops(d);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        if !matches!(dst, Dst::S(_) | Dst::Null) {
+            return None;
+        }
+        Some((dst, v, lane & 63))
+    }
+
+    /// Check that `mid` is a plain, modifier-free binary VALU op writing VGPR `v` with inputs
+    /// `{S(s_in), V(v)}` in either order. Returns `Some(s_first)` (`true` if `ins[0]` is `S(s_in)`).
+    fn x64_match_binary_valu(mid: &Decoded, v: u64, s_in: u64) -> Option<bool> {
+        if mid.variant != Variant::Plain {
+            return None;
+        }
+        let m = Self::mods(mid);
+        if m.clamp || m.omod != 0 || m.opsel != 0 || m.abs.iter().any(|&x| x) || m.neg.iter().any(|&x| x) {
+            return None;
+        }
+        let (outs, ins) = Self::ops(mid);
+        if outs.len() != 1 || ins.len() != 2 {
+            return None;
+        }
+        if !matches!(Self::dst_of(mid, &outs[0]), Dst::V(dv) if dv == v) {
+            return None;
+        }
+        let decode_op = |o: &Operand| -> Option<(bool, u64)> {
+            let f = o.field?;
+            let raw = rdna2::field_value(mid.enc, &mid.words, f)? * rdna2::register_scale(f);
+            if f == "VSRC1" || o.ty.starts_with("OPR_VGPR") {
+                Some((false, raw))
+            } else if raw >= 256 {
+                Some((false, raw - 256))
+            } else if raw <= 124 || raw == 126 || raw == 127 {
+                Some((true, raw))
+            } else {
+                None
+            }
+        };
+        let (op0, op1) = (decode_op(&ins[0])?, decode_op(&ins[1])?);
+        if op0 == (true, s_in) && op1 == (false, v) {
+            Some(true)
+        } else if op0 == (false, v) && op1 == (true, s_in) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Scalar HLSL expression matching `emit.rs` for one lane of a supported 32-bit reduction op.
+    fn x64_reduction_expr32(&self, name: &str, lhs: &str, rhs: &str, old: &str) -> Option<String> {
+        Some(match name {
+            "V_ADD_NC_U32" => format!("({lhs} + {rhs})"),
+            "V_ADD_F32" => format!("asuint(asfloat({lhs}) + asfloat({rhs}))"),
+            "V_MIN_F32" => format!("asuint(min(asfloat({lhs}), asfloat({rhs})))"),
+            "V_MAX_F32" => format!("asuint(max(asfloat({lhs}), asfloat({rhs})))"),
+            "V_MIN_U32" => format!("min({lhs}, {rhs})"),
+            "V_MAX_U32" => format!("max({lhs}, {rhs})"),
+            "V_MIN_I32" => format!("(uint)min((int){lhs}, (int){rhs})"),
+            "V_MAX_I32" => format!("(uint)max((int){lhs}, (int){rhs})"),
+            "V_AND_B32" => format!("({lhs} & {rhs})"),
+            "V_OR_B32" => format!("({lhs} | {rhs})"),
+            "V_XOR_B32" => format!("({lhs} ^ {rhs})"),
+            "V_ADD_F16" => {
+                let sum = to_f16_expr(self.dynamic_f16_rm, &format!("(f16tof32({lhs} & 0xFFFFu) + f16tof32({rhs} & 0xFFFFu))"));
+                format!("(({old} & 0xFFFF0000u) | {sum})")
+            }
+            _ => return None,
+        })
+    }
+
+    /// Fold split-wave64 cross-half `v_readlane_b32` reduction tails (and direct `(L, L^32)` pairs)
+    /// into a single `xcl_x_meet()` exchange. Both halves already receive both `v[L]` and `v[L^32]`
+    /// from the first exchange, so the trailing `v_readlane_b32` of the updated lane needs no
+    /// second exchange.
+    fn try_emit_x64_reduction_tail(&mut self, rest: &[Decoded]) -> Option<usize> {
+        let (dst1, v1, l1) = self.x64_const_readlane(&rest[0])?;
+        let l2 = l1 ^ 32;
+        let lane32 = l1 & 31;
+
+        // 1. Direct pair: v_readlane(s1, v, L) ; v_readlane(s2, v, L^32)
+        if rest.len() >= 2 {
+            if let Some((dst2, v2, l_b)) = self.x64_const_readlane(&rest[1]) {
+                if v2 == v1 && l_b == l2 {
+                    self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                    self.line(&format!("// {:04x}: {}", rest[1].pc, rdna2::format(&rest[1])));
+                    self.cur_pc = rest[1].pc;
+                    let v = self.vreg(v1);
+                    let t = self.t();
+                    self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
+                    self.line(&format!("xcl_x_put(0u, {t}_m);"));
+                    self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                    self.line(&format!("uint {t}_r1 = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
+                    self.line(&format!("uint {t}_r2 = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
+                    self.write32(&dst1, &format!("{t}_r1"));
+                    self.write32(&dst2, &format!("{t}_r2"));
+                    return Some(2);
+                }
+            }
+        }
+
+        // 2. 32-bit reduction tail: v_readlane(s1, v, L) ; v_op(v, s1, v) ; v_readlane(s2, v, L^32)
+        if rest.len() >= 3 {
+            if let (&Dst::S(s1), Some((dst2, v2, l_b))) = (&dst1, self.x64_const_readlane(&rest[2])) {
+                if s1 != 126 && s1 != 127 && v2 == v1 && l_b == l2 {
+                    if let Some(s_first) = Self::x64_match_binary_valu(&rest[1], v1, s1) {
+                        let t = self.t();
+                        let (r1, r2) = (format!("{t}_r1"), format!("{t}_r2"));
+                        let (lhs, rhs) = if s_first { (r1.as_str(), r2.as_str()) } else { (r2.as_str(), r1.as_str()) };
+                        if let Some(expr) = self.x64_reduction_expr32(rest[1].inst.name, lhs, rhs, &r2) {
+                            self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                            self.cur_pc = rest[0].pc;
+                            let v = self.vreg(v1);
+                            self.line(&format!("uint {t}_m = WaveReadLaneAt({v}, {lane32}u);"));
+                            self.line(&format!("xcl_x_put(0u, {t}_m);"));
+                            self.line(&format!("uint {t}_o = xcl_x_meet() ? xcl_x_get(0u) : 0u;"));
+                            self.line(&format!("uint {r1} = xcl_half == {}u ? {t}_m : {t}_o;", l1 >> 5));
+                            self.line(&format!("uint {r2} = xcl_half == {}u ? {t}_m : {t}_o;", l2 >> 5));
+                            self.write32(&Dst::S(s1), &r1);
+                            // Emit the VALU instruction normally so all 64 lanes of v stay exact
+                            self.inst(&rest[1], rest[2].pc);
+                            self.line(&format!("// {:04x}: {}", rest[2].pc, rdna2::format(&rest[2])));
+                            self.cur_pc = rest[2].pc;
+                            let exec_w = self.sreg(if l2 < 32 { 126 } else { 127 });
+                            let mask = 1u32 << (l2 & 31);
+                            self.line(&format!("uint {t}_out = (({exec_w} & {mask:#x}u) != 0u) ? ({expr}) : {r2};"));
+                            self.write32(&dst2, &format!("{t}_out"));
+                            return Some(3);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 64-bit reduction tail:
+        //    v_readlane(s, v, L) ; v_readlane(s+1, v+1, L) ; v_add_f64 v[v:v+1], s[s:s+1], v[v:v+1] ;
+        //    v_readlane(o0, v, L^32) ; v_readlane(o1, v+1, L^32)
+        if rest.len() >= 5 && rest[2].inst.name == "V_ADD_F64" {
+            if let (&Dst::S(s_lo), Some((Dst::S(s_hi), v_hi, l_hi)), Some((out_lo, vo0, lo0)), Some((out_hi, vo1, lo1))) = (
+                &dst1,
+                self.x64_const_readlane(&rest[1]),
+                self.x64_const_readlane(&rest[3]),
+                self.x64_const_readlane(&rest[4]),
+            ) {
+                if s_hi == s_lo + 1
+                    && s_lo != 126
+                    && s_lo != 127
+                    && s_hi != 126
+                    && s_hi != 127
+                    && v_hi == v1 + 1
+                    && l_hi == l1
+                    && vo0 == v1
+                    && vo1 == v1 + 1
+                    && lo0 == l2
+                    && lo1 == l2
+                {
+                    if let Some(s_first) = Self::x64_match_binary_valu(&rest[2], v1, s_lo) {
+                        self.x64_words = self.x64_words.max(2);
+                        self.line(&format!("// {:04x}: {}", rest[0].pc, rdna2::format(&rest[0])));
+                        self.line(&format!("// {:04x}: {}", rest[1].pc, rdna2::format(&rest[1])));
+                        self.cur_pc = rest[1].pc;
+                        let (vl, vh) = (self.vreg(v1), self.vreg(v1 + 1));
+                        let t = self.t();
+                        self.line(&format!("uint {t}_ml = WaveReadLaneAt({vl}, {lane32}u);"));
+                        self.line(&format!("uint {t}_mh = WaveReadLaneAt({vh}, {lane32}u);"));
+                        self.line(&format!("xcl_x_put(0u, {t}_ml); xcl_x_put(1u, {t}_mh);"));
+                        self.line(&format!("bool {t}_ok = xcl_x_meet();"));
+                        self.line(&format!("uint {t}_ol = {t}_ok ? xcl_x_get(0u) : 0u;"));
+                        self.line(&format!("uint {t}_oh = {t}_ok ? xcl_x_get(1u) : 0u;"));
+                        let (h1, h2) = (l1 >> 5, l2 >> 5);
+                        self.line(&format!("uint {t}_l1 = xcl_half == {h1}u ? {t}_ml : {t}_ol;"));
+                        self.line(&format!("uint {t}_h1 = xcl_half == {h1}u ? {t}_mh : {t}_oh;"));
+                        self.line(&format!("uint {t}_l2 = xcl_half == {h2}u ? {t}_ml : {t}_ol;"));
+                        self.line(&format!("uint {t}_h2 = xcl_half == {h2}u ? {t}_mh : {t}_oh;"));
+                        self.write32(&Dst::S(s_lo), &format!("{t}_l1"));
+                        self.write32(&Dst::S(s_hi), &format!("{t}_h1"));
+                        self.inst(&rest[2], rest[3].pc);
+                        self.line(&format!("// {:04x}: {}", rest[3].pc, rdna2::format(&rest[3])));
+                        self.line(&format!("// {:04x}: {}", rest[4].pc, rdna2::format(&rest[4])));
+                        self.cur_pc = rest[4].pc;
+                        let (d1, d2) = (format!("asdouble({t}_l1, {t}_h1)"), format!("asdouble({t}_l2, {t}_h2)"));
+                        let sum = if s_first { format!("{d1} + {d2}") } else { format!("{d2} + {d1}") };
+                        self.line(&format!("double {t}_d = {sum}; uint {t}_sl, {t}_sh; asuint({t}_d, {t}_sl, {t}_sh);"));
+                        let exec_w = self.sreg(if l2 < 32 { 126 } else { 127 });
+                        let mask = 1u32 << (l2 & 31);
+                        self.line(&format!("bool {t}_act = ({exec_w} & {mask:#x}u) != 0u;"));
+                        self.line(&format!("uint {t}_outl = {t}_act ? {t}_sl : {t}_l2;"));
+                        self.line(&format!("uint {t}_outh = {t}_act ? {t}_sh : {t}_h2;"));
+                        self.write32(&out_lo, &format!("{t}_outl"));
+                        self.write32(&out_hi, &format!("{t}_outh"));
+                        return Some(5);
+                    }
+                }
+            }
+        }
+
+        None
+    }
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
@@ -850,10 +1267,12 @@ impl Em {
         }
         // s_sendmsg is a no-op except GS_ALLOC_REQ (mesh) and GS emit/cut (geometry)
         let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
-        if NOOPS.contains(&name.as_str()) && !mesh_msg {
+        let frexp_denorm_write = name == "s_denorm_mode" && self.track_frexp_denorm;
+        if NOOPS.contains(&name.as_str()) && !mesh_msg && !frexp_denorm_write {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
         }
+        let seed = self.reductions.seeds.get(&d.pc).copied();
         let r = match d.enc.name {
             "ENC_SOPP" => return self.sopp(d, &name, next),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
@@ -870,6 +1289,10 @@ impl Em {
         if let Err(why) = r {
             self.unsupported(d, why);
         }
+        if let Some(v) = seed {
+            let v = self.vreg(v);
+            self.line(&format!("uint xcl_seed_{:x} = {v};", d.pc));
+        }
         Flow::Next
     }
 
@@ -881,7 +1304,15 @@ impl Em {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
                     self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
-                } else if matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
+                } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
+                    if self.safe_barrier {
+                        self.line("xcl_s_barrier();");
+                    } else if self.compute_or_mesh_hw_waves() == Some(1) {
+                        self.line("GroupMemoryBarrier();");
+                    } else {
+                        self.line("GroupMemoryBarrierWithGroupSync();");
+                    }
+                } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
                 }
                 Flow::Next
@@ -913,6 +1344,11 @@ impl Em {
                         "if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, {m0} & 0x3FFu); res.Store(xcl_rec * 4u + 4u, ({m0} >> 12) & 0x7FFu); }}"
                     ));
                 }
+                Flow::Next
+            }
+            "s_denorm_mode" => {
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
+                self.line(&format!("xcl_frexp_f32_denorm = {}u;", 1 + (simm & 1)));
                 Flow::Next
             }
             "s_round_mode" => {
@@ -961,9 +1397,21 @@ impl Em {
 
     fn setreg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+        let denorm_shift = if self.track_frexp_denorm { frexp_f32_denorm_shift(simm) } else { None };
+        if let Some(shift) = denorm_shift {
+            if name == "s_setreg_imm32_b32" {
+                let imm = d.literal.ok_or("literal")?;
+                self.line(&format!("xcl_frexp_f32_denorm = {}u;", 1 + ((imm >> shift) & 1)));
+            } else {
+                let src = self.code32(Self::field(d, "SDST"), None, false).ok_or("register")?;
+                self.line(&format!("xcl_frexp_f32_denorm = 1u + (({src} >> {shift}u) & 1u);"));
+            }
+        }
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
         if sp_mask == 0 && dp_mask == 0 {
-            *self.ignored.entry(name.to_string()).or_default() += 1;
+            if denorm_shift.is_none() {
+                *self.ignored.entry(name.to_string()).or_default() += 1;
+            }
             return Ok(());
         }
         if name == "s_setreg_imm32_b32" {
@@ -983,7 +1431,7 @@ impl Em {
                     let keep = (!dp_mask) & 3;
                     self.line(&format!("xcl_fp16_rm = (xcl_fp16_rm & {keep}u) | {dp}u;"));
                 }
-            } else {
+            } else if denorm_shift.is_none() {
                 *self.ignored.entry(name.to_string()).or_default() += 1;
             }
             return Ok(());
@@ -1011,7 +1459,7 @@ impl Em {
                 _ => format!("xcl_fp16_rm = (xcl_fp16_rm & 1u) | (({src} & 1u) << 1);"),
             };
             self.line(&stmt);
-        } else {
+        } else if denorm_shift.is_none() {
             *self.ignored.entry(name.to_string()).or_default() += 1;
         }
         Ok(())
@@ -1253,7 +1701,15 @@ impl Em {
             _ => return Err("SALU"),
         };
         self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
+        // "is a lane left" of a lane mask (an AND with EXEC or VCC) in a pixel shader: over the
+        // live lanes (`mask_live`)
+        let lanes_left = matches!(name, "s_and_b32" | "s_andn2_b32")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(mask_live({t}) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
@@ -1465,11 +1921,16 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.window(&d1);
             self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
             self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
-            self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            if self.opt.mem_windows > 1 {
+                self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+            } else {
+                self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            }
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
             // access is a switch between them (`windowed`): one per dword made DXC several
@@ -1491,9 +1952,17 @@ impl Em {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
-            self.window(&hi);
             // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
-            self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            if self.opt.mem_windows > 1 {
+                self.line(&format!(
+                    "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
+                    hex(imm)
+                ));
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+            } else {
+                self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            }
             match count {
                 1 => {
                     self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
@@ -1529,20 +1998,81 @@ impl Em {
         Ok(())
     }
 
-    /// Several memory windows: the accesses that follow go to the window of the address
-    /// whose high dword (bits 32..63) is `hi` (`xcl_w`, read by the `mem` accessors).
-    fn window(&mut self, hi: &str) {
+    /// Several memory windows: select the window for a READ whose high dword (bits 32..63) is
+    /// `hi`. 32-bit console descriptor table pointers pass `hi == 0` (window 0); any other `hi`
+    /// outside `[xcl_uma_base, xcl_uma_base + mem_windows)` falls into the `default` arm of the
+    /// memory accessors (reads 0, never aliases another window).
+    fn window_read(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
-            self.line(&format!("xcl_w = ({hi}) & 3u;"));
+            let t = self.t();
+            self.line(&format!("uint {t}_hi = {hi}; xcl_w = select({t}_hi == 0u, 0u, {t}_hi - xcl_uma_base);"));
         }
     }
 
-    /// `window` for a FLAT / global address: SADDR pair (global with SADDR) or the 64-bit
-    /// VGPR address.
-    fn flat_window(&mut self, global: bool, saddr: u64, addr: u64) {
+    /// Several memory windows: select the window for a WRITE / ATOMIC whose high dword is `hi`.
+    /// Unlike reads, `hi == 0` is NOT mapped to window 0 (unless `xcl_uma_base == 0`), so null
+    /// pointers and out-of-UMA addresses are dropped instead of clobbering window 0 descriptor
+    /// heaps or coherent window 3 CPU memory.
+    fn window_write(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
-            let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(addr + 1) };
-            self.window(&hi);
+            self.line(&format!("xcl_w = ({hi}) - xcl_uma_base;"));
+        }
+    }
+
+    /// Compute the effective address of a FLAT / GLOBAL access into `uint {t}_a` (masked by
+    /// `~align_mask` when non-zero) and, when `mem_windows > 1`, select `xcl_w` from the exact
+    /// 64-bit address (carrying/borrowing across 4 GiB window boundaries).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_addr(&mut self, global: bool, addtid: bool, saddr: u64, addr: u64, off: u32, align_mask: u32, is_write: bool, t: &str) {
+        let has_saddr = (addtid || global) && saddr != 0x7D && saddr != 0x7F;
+        if self.opt.mem_windows > 1 {
+            let off64 = if global { format!("(uint64_t)(int64_t)(int){}", hex(off)) } else { format!("(uint64_t){}", hex(off)) };
+            let ea = if addtid {
+                if has_saddr {
+                    let (s_lo, s_hi) = (self.sreg(saddr), self.sreg(saddr + 1));
+                    format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t)(4u * lane_id) + {off64}")
+                } else {
+                    format!("(uint64_t)(4u * lane_id) + {off64}")
+                }
+            } else if has_saddr {
+                let (s_lo, s_hi) = (self.sreg(saddr), self.sreg(saddr + 1));
+                let v_lo = self.vreg(addr);
+                format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t){v_lo} + {off64}")
+            } else {
+                let (v_lo, v_hi) = (self.vreg(addr), self.vreg(addr + 1));
+                format!("((((uint64_t){v_hi}) << 32) | (uint64_t){v_lo}) + {off64}")
+            };
+            self.line(&format!("uint64_t {t}_ea = {ea};"));
+            if is_write {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            if align_mask == 0 {
+                self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+            } else {
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~{align_mask}u;"));
+            }
+        } else {
+            let base = if addtid {
+                if has_saddr {
+                    format!("{} + 4u * lane_id", self.sreg(saddr))
+                } else {
+                    "4u * lane_id".to_string()
+                }
+            } else {
+                let v_lo = self.vreg(addr);
+                if has_saddr {
+                    format!("{} + {v_lo}", self.sreg(saddr))
+                } else {
+                    v_lo
+                }
+            };
+            if align_mask == 0 {
+                self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+            } else {
+                self.line(&format!("uint {t}_a = ({base} + {}) & ~{align_mask}u;", hex(off)));
+            }
         }
     }
 
@@ -1550,7 +2080,7 @@ impl Em {
     /// (register `static_sampler_base + i`, space 1), else the sampler heap entry S# word 3
     /// [11:0] names (XCL shader ABI).
     fn sampler_ref(&mut self, pc: u64, comparison: bool, s3: &str) -> String {
-        let Some(&w) = self.static_ss.get(&pc) else { return format!("SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)]") };
+        let Some(&w) = self.static_ss.get(&pc) else { return format!("SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0x7FFu)]") };
         let i = match self.static_used.iter().position(|&x| x == (w, comparison)) {
             Some(i) => i,
             None => {
@@ -1593,15 +2123,35 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            if is_store {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        }
         let act = self.act();
-        let in_range = |bytes: String| format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})");
+        let multi = self.opt.mem_windows > 1;
+        let in_range = |bytes: String| {
+            if multi {
+                format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
+            } else {
+                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
+            }
+        };
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
             let v = self.vreg(vdata);
@@ -1759,6 +2309,7 @@ impl Em {
     fn export_graphics(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[String]) -> Result<(), &'static str> {
         let act = self.act();
         let done = rdna2::field_value(d.enc, &d.words, "DONE") == Some(1);
+        let vm = rdna2::field_value(d.enc, &d.words, "VM") == Some(1);
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
         let mut st = Vec::new();
         match (&self.opt.mode, tgt) {
@@ -1793,32 +2344,34 @@ impl Em {
                 }
             }
             (Mode::Pixel(ps), 0..=7) => {
-                let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) else {
+                if let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) {
+                    for c in 0..4 {
+                        if !enabled(c) {
+                            continue;
+                        }
+                        let raw = Self::exp_comp(srcs, compr, c);
+                        let v = match (e.component_type, compr) {
+                            (3, true) => format!("f16tof32({raw})"),
+                            (3, false) => format!("asfloat({raw})"),
+                            (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
+                            (2, false) => format!("(int){raw}"),
+                            (_, _) => raw,
+                        };
+                        st.push(format!("xo.t{tgt}[{c}] = {v};"));
+                    }
+                } else {
                     self.line("/* export to an undeclared SV_Target */");
-                    if done {
-                        self.ps_done = true;
-                        self.line(&format!("if ({act}) xcl_live = true;"));
-                    }
-                    return Ok(());
-                };
-                for c in 0..4 {
-                    if !enabled(c) {
-                        continue;
-                    }
-                    let raw = Self::exp_comp(srcs, compr, c);
-                    let v = match (e.component_type, compr) {
-                        (3, true) => format!("f16tof32({raw})"),
-                        (3, false) => format!("asfloat({raw})"),
-                        (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
-                        (2, false) => format!("(int){raw}"),
-                        (_, _) => raw,
-                    };
-                    st.push(format!("xo.t{tgt}[{c}] = {v};"));
                 }
             }
             (Mode::Pixel(ps), 8) => {
                 if en & 1 == 1 && ps.outputs.iter().any(|e| matches!(e.system_value, 65 | 67 | 68)) {
                     st.push(format!("xo.xcl_depth = asfloat({});", srcs[0]));
+                }
+                // the sample mask: z of the 32-bit formats, VSRC1 [15:0] of the compressed one
+                // (Mesa, ac_nir_lower_ps_late.c, emit_ps_mrtz_export)
+                if enabled(2) && ps.outputs.iter().any(|e| e.system_value == 66) {
+                    self.ps_writes_mask = true;
+                    st.push(format!("xo.xcl_mask = {};", Self::exp_comp(srcs, compr, 2)));
                 }
             }
             (Mode::Pixel(_), 9) => {}
@@ -1854,9 +2407,16 @@ impl Em {
         if !st.is_empty() {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
         }
-        if done && matches!(self.opt.mode, Mode::Pixel(_)) {
-            self.ps_done = true;
-            self.line(&format!("if ({act}) xcl_live = true;"));
+        if matches!(self.opt.mode, Mode::Pixel(_)) {
+            if self.has_ps_vm {
+                if vm {
+                    self.ps_done = true;
+                    self.line(&format!("xcl_live = ({act});"));
+                }
+            } else if done {
+                self.ps_done = true;
+                self.line(&format!("if ({act}) xcl_live = true;"));
+            }
         }
         Ok(())
     }
@@ -1991,11 +2551,16 @@ impl Em {
                 None => format!("((uint64_t)({node} & ~7u) << 3)"),
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
-            self.window(&format!("(uint)({a} >> 32)"));
+            self.window_read(&format!("(uint)({a} >> 32)"));
             self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
+        }
+        // gather4h / gather4h_pck / gather8h_pck fetch a horizontal row of texels, not the 2x2
+        // footprint of Gather: rejected until the row's position and rounding are measured
+        if base.starts_with("gather4h") || base.starts_with("gather8h") {
+            return Err("image_gather4h");
         }
         // body coordinates per DIM: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
         let body = [1u64, 2, 3, 3, 2, 3, 3, 4][dim as usize];
@@ -2081,8 +2646,13 @@ impl Em {
         let t = self.t();
         let tw0 = self.sreg(srsrc);
         let tw1 = self.sreg(srsrc + 1);
+        let tw3 = self.sreg(srsrc + 3);
         let act = self.act();
         let ps = matches!(self.opt.mode, Mode::Pixel(_));
+        // Guard against null / unpatched / OOB T# descriptors so AMD Tier-3 GPUs never page-fault
+        // indexing `ResourceDescriptorHeap` (valid XCL T#: type >= 8, BASE_ADDRESS_HI cleared,
+        // SRV index < (1 << 21) - 1 so `tw0 + 1` stays in bounds without wrapping).
+        self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < {}u);", crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
@@ -2166,7 +2736,17 @@ impl Em {
                 return Err("MIMG unorm");
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            let gather = base.starts_with("gather4");
+            let implicit_lod = ps && !gather && !has_lz && grads.is_none() && lod.is_none();
+            let idx = if implicit_lod {
+                self.line(&format!("uint {t}_tw0 = select({t}_ok, {tw0}, 0u);"));
+                format!("{t}_tw0")
+            } else {
+                self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{"));
+                tw0.clone()
+            };
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({idx})];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
@@ -2178,7 +2758,6 @@ impl Em {
                 };
                 self.texel_offset(&t, dim, o, &level, "");
             }
-            let gather = base.starts_with("gather4");
             let call = if gather {
                 if comps.len() != 1 {
                     return Err("gather4 dmask");
@@ -2235,18 +2814,23 @@ impl Em {
                         self.line(&format!("float4 {t}_m1 = {t}_T.SampleLevel({t}_S, {c1}, (float)({l1}));"));
                         self.line(&format!("float4 {t}_s1 = {t}_T.Sample({t}_S, {});", tail(coord.clone())));
                         // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
-                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
-                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso bilinear (3)
+                        // min / mag filter, and linear = bilinear or aniso bilinear (aniso point is
+                        // point), as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
                         // the mag filter, so mip 0 of a minified sample needs min = mag.
                         self.line(&format!(
-                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag >= 2u || {t}_min >= 2u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || (({t}_mag | ({t}_mag >> 1)) & 1u) == (({t}_min | ({t}_min >> 1)) & 1u));"
+                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag == 3u || {t}_min == 3u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || ({t}_mag & 1u) == ({t}_min & 1u));"
                         ));
                         format!("({t}_pm ? lerp({t}_m0, {t}_m1, {t}_L - {t}_l0) : {t}_s1)")
                     }
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
-            self.line(&format!("uint4 {t}_r = asuint({call});"));
+            if implicit_lod {
+                self.line(&format!("uint4 {t}_r = ({t}_ok ? asuint({call}) : uint4(0u, 0u, 0u, 0u));"));
+            } else {
+                self.line(&format!("{t}_r = asuint({call}); }}"));
+            }
             let n = if gather { 4 } else { comps.len() };
             let comps2 = comps.clone();
             let sel = move |k: usize| if gather { k as u64 } else { comps2[k] };
@@ -2270,11 +2854,12 @@ impl Em {
                 _ => return Err("MIMG dim"),
             };
             let s3 = self.sreg(ssamp + 3);
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            self.line(&format!("uint {t}_tw0 = select({t}_ok, {tw0}, 0u);"));
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({t}_tw0)];"));
             let sampler = self.sampler_ref(d.pc, false, &s3);
             self.line(&format!("SamplerState {t}_S = {sampler};"));
             self.line(&format!(
-                "uint4 {t}_r = asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f));"
+                "uint4 {t}_r = ({t}_ok ? asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f)) : uint4(0u, 0u, 0u, 0u));"
             ));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &f16);
@@ -2284,18 +2869,38 @@ impl Em {
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let (ty, call) = match dim {
-                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
-                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 0u;")),
+                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 0u;")),
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 // the hardware returns the layers (6 per cube), as for a 2D array
                 3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
-                4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_d, {t}_n); {t}_h = 1u;")),
+                // RDNA gives a 1D array's layers in y (only GFX9, which binds it as a 2D array, in z)
+                4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = {t}_h;")),
                 5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
             };
-            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
-            self.line(&format!("uint {t}_w, {t}_h, {t}_d, {t}_n; {call}"));
-            self.line(&format!("uint4 {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n);"));
+            self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
+            // a level past the last: RDNA2 gives 0 for every size and the level count. D3D12 asks
+            // for the same, but an AMD driver (RDNA4) answers for a level it clamped
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} if ({mipv} >= {t}_n) {{ {t}_w = 0u; {t}_h = 0u; {t}_d = 0u; }} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            let query = if matches!(dim, 0 | 1) {
+                // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+                // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+                // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+                // the level count to the host (RADV: log2(samples) + 1).
+                let ms = |ty: &str, extra: &str| {
+                    format!("{{ {ty}<float4> {t}_M = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {extra}{t}_s; {t}_M.GetDimensions({t}_w, {t}_h, {extra}{t}_s); {t}_r = uint4({t}_w, {t}_h, 0u, 1u); }}")
+                };
+                format!(
+                    "if (({tw3} >> 28) == 14u) {} else if (({tw3} >> 28) == 15u) {} else {query}",
+                    ms("Texture2DMS", ""),
+                    ms("Texture2DMSArray", &format!("{t}_e, "))
+                )
+            } else {
+                query
+            };
+            self.line(&format!("if (and({act}, {t}_ok)) {{ {query} }}"));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());
@@ -2317,17 +2922,35 @@ impl Em {
             return Err("image_load cube");
         }
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
+        if (base.starts_with("store") || base.starts_with("atomic_")) && self.img_writes.contains(&srsrc) {
+            self.line(&format!("if ({t}_ok) xcl_iw{srsrc} = {tw0} + 1u;"));
+        }
         match base {
             "load" | "load_mip" => {
-                self.line(&format!("uint4 {t}_r;"));
+                self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
                 let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
-                self.line(&format!(
+                let srv = format!(
                     "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
-                ));
+                );
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let rw: Vec<String> = if base == "load" && dim != 6 { self.img_writes.iter().map(|s| format!("xcl_iw{s} == {tw0} + 1u")).collect() } else { Vec::new() };
+                if rw.is_empty() {
+                    self.line(&format!("if (and({act}, {t}_ok)) {{ {srv} }}"));
+                } else {
+                    let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                    self.line(&format!("bool {t}_rw = {};", rw.join(" || ")));
+                    self.line(&format!(
+                        "if (and({act}, {t}_ok)) {{ if ({t}_rw) {{ if ({t}_cls == 1u) {{ {} {t}_r = {t}_U[{icoord}]; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({t}_U[{icoord}]); }} else {{ {} {t}_r = asuint({t}_U[{icoord}]); }} }} else {{ {srv} }} }}",
+                        uav("uint"),
+                        uav("int"),
+                        uav("float")
+                    ));
+                }
                 let cls = format!("{t}_cls");
                 let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
                 let comps2 = comps.clone();
@@ -2352,7 +2975,7 @@ impl Em {
                 let v4 = format!("uint4({})", vals.join(", "));
                 let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
                 self.line(&format!(
-                    "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
+                    "if (and({act}, {t}_ok)) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
                     uav("int"),
                     uav("float")
@@ -2361,10 +2984,9 @@ impl Em {
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
-                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
                 self.line(&format!("uint {t}_old = 0u;"));
                 let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
-                self.line(&format!("if ({act}) {{ {body} }}"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{ RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)]; {body} }}"));
                 if f("GLC") == 1 {
                     self.line(&format!("if ({act}) {v} = {t}_old;"));
                 }
@@ -2384,9 +3006,8 @@ impl Em {
                 let v = self.vreg(vdata);
                 let vt = if signed { "int" } else { "uint" };
                 let val = if signed { format!("(int){v}") } else { v.clone() };
-                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
                 self.line(&format!("{vt} {t}_old = 0;"));
-                self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
+                self.line(&format!("if (and({act}, {t}_ok)) {{ RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)]; {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
                 if f("GLC") == 1 {
                     self.line(&format!("if ({act}) {v} = (uint){t}_old;"));
                 }
@@ -2618,6 +3239,10 @@ impl Em {
         let dot: Option<String> = match name {
             "v_dot2_f32_f16" => {
                 let mut c = format!("asfloat({})", src(2));
+                // SRC2 is f32: its NEG_HI bit is ABS (applied before NEG), as in v_fma_mix*
+                if neg_hi >> 2 & 1 == 1 {
+                    c = format!("abs({c})");
+                }
                 if neg >> 2 & 1 == 1 {
                     c = format!("(-{c})");
                 }
@@ -2793,6 +3418,73 @@ impl Em {
         Ok(())
     }
 
+    /// Quad-byte SAD (`v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_mqsad_u32_u8`): slides the
+    /// 4-byte pattern in `SRC1` across bytes 0..3, 1..4, 2..5, 3..6 of `SRC0` (skipping bytes
+    /// where `SRC1`'s byte is zero for `mqsad`) and adds into `SRC2`, saturating per element
+    /// when `CLAMP` is set.
+    fn valu_qsad(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if d.variant != Variant::Plain {
+            return Err("quad-SAD SDWA/DPP");
+        }
+        let (outs, ins) = Self::ops(d);
+        let clamp = Self::mods(d).clamp;
+        let masked = name.starts_with("v_mqsad");
+        let wide = name == "v_mqsad_u32_u8";
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
+        let limit = if wide { 252 } else { 254 };
+        if matches!(dst, Dst::V(n) if n > limit) {
+            return Err("quad-SAD VDST out of range");
+        }
+        let (s0_lo, s0_hi) = self.read64(d, ins.first().ok_or("op")?, false).ok_or("op")?;
+        let s1 = self.read(d, ins.get(1).ok_or("op")?, false).ok_or("op")?;
+        let s2_op = ins.get(2).ok_or("op")?;
+        let sad = if masked { "msad_u8" } else { "sad_u8" };
+        let t = self.t();
+        self.line(&format!("uint {t}_l = {s0_lo}; uint {t}_h = {s0_hi}; uint {t}_r = {s1};"));
+        let wins = [
+            format!("{t}_l"),
+            format!("(({t}_l >> 8) | ({t}_h << 24))"),
+            format!("(({t}_l >> 16) | ({t}_h << 16))"),
+            format!("(({t}_l >> 24) | ({t}_h << 8))"),
+        ];
+        if wide {
+            let f = s2_op.field.ok_or("op")?;
+            let code = Self::field(d, f);
+            if !(256..=508).contains(&code) {
+                return Err("quad-SAD SRC2 not a 4-VGPR range");
+            }
+            let base = code - 256;
+            for (i, w) in wins.iter().enumerate() {
+                let acc = self.vreg(base + i as u64);
+                let sum = format!("{sad}({w}, {t}_r)");
+                let expr = if clamp { format!("sat_u32((uint64_t){sum} + (uint64_t){acc})") } else { format!("{sum} + {acc}") };
+                self.line(&format!("uint {t}_{i} = {expr};"));
+            }
+            if let Dst::V(dn) = dst {
+                let act = self.act();
+                let writes: Vec<String> = (0..4)
+                    .map(|i| {
+                        let vd = self.vreg(dn + i as u64);
+                        format!("{vd} = select({act}, {t}_{i}, {vd});")
+                    })
+                    .collect();
+                self.line(&writes.join(" "));
+            }
+        } else {
+            let (a_lo, a_hi) = self.read64(d, s2_op, false).ok_or("op")?;
+            self.line(&format!(
+                "uint {t}_0 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_lo}, {clamp});",
+                wins[0], wins[1]
+            ));
+            self.line(&format!(
+                "uint {t}_1 = pk_sad_u16({sad}({}, {t}_r), {sad}({}, {t}_r), {a_hi}, {clamp});",
+                wins[2], wins[3]
+            ));
+            self.write64(&dst, &format!("{t}_0"), &format!("{t}_1"));
+        }
+        Ok(())
+    }
+
     /// 16-bit VALU (f16 / u16 / i16 / b16): sources are the low halves (VOP3 op_sel picks the
     /// high half per source), results go to the low half (op_sel[3]: high half) and the other
     /// half is preserved – AnyPS5 `write16Bits` (GPL-2.0, ported 2026-11-20).
@@ -2864,6 +3556,7 @@ impl Em {
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),
@@ -2970,26 +3663,31 @@ impl Em {
                 self.write_mask(&dst, &cond);
                 return Ok(());
             }
-            let (a, b) = match ty {
-                "u64" => (u64v(0), u64v(1)),
-                "i64" => (format!("(int64_t){}", u64v(0)), format!("(int64_t){}", u64v(1))),
-                "f64" => (f64v(0), f64v(1)),
-                _ => return Err("VOPC 64"),
-            };
-            let cond = if ty == "f64" {
-                float_compare(op, &a, &b, "isnan_d").ok_or("VOPC 64")?
-            } else {
-                match op {
-                    "f" => "false".to_string(),
-                    "lt" => format!("{a} < {b}"),
-                    "eq" => format!("{a} == {b}"),
-                    "le" => format!("{a} <= {b}"),
-                    "gt" => format!("{a} > {b}"),
-                    "ne" | "lg" => format!("{a} != {b}"),
-                    "ge" => format!("{a} >= {b}"),
-                    "t" | "tru" => "true".to_string(),
-                    _ => return Err("VOPC 64"),
+            let cond = match ty {
+                "f64" => float_compare(op, &f64v(0), &f64v(1), "isnan_d").ok_or("VOPC 64")?,
+                "u64" | "i64" => {
+                    // Lower 64-bit integer comparisons as 32-bit high/low dword comparisons so
+                    // DXC never emits `icmp i64` (miscompiled by AMD's D3D12 compiler on RDNA
+                    // when operands share a register/dword, e.g. `v[1:2]` vs `v[2:3]`).
+                    let ((al, ah), (bl, bh)) = (&lo_hi[0], &lo_hi[1]);
+                    let (ha, hb) = if ty == "i64" {
+                        (format!("(int)({ah})"), format!("(int)({bh})"))
+                    } else {
+                        (ah.clone(), bh.clone())
+                    };
+                    match op {
+                        "f" => "false".to_string(),
+                        "t" | "tru" => "true".to_string(),
+                        "eq" => format!("(({ah}) == ({bh}) && ({al}) == ({bl}))"),
+                        "ne" | "lg" => format!("(({ah}) != ({bh}) || ({al}) != ({bl}))"),
+                        "lt" => format!("({ha} < {hb} || (({ah}) == ({bh}) && ({al}) < ({bl})))"),
+                        "le" => format!("({ha} < {hb} || (({ah}) == ({bh}) && ({al}) <= ({bl})))"),
+                        "gt" => format!("({ha} > {hb} || (({ah}) == ({bh}) && ({al}) > ({bl})))"),
+                        "ge" => format!("({ha} > {hb} || (({ah}) == ({bh}) && ({al}) >= ({bl})))"),
+                        _ => return Err("VOPC 64"),
+                    }
                 }
+                _ => return Err("VOPC 64"),
             };
             let dst = if name.starts_with("v_cmpx_") { Dst::S(126) } else { dst };
             self.write_mask(&dst, &cond);
@@ -3006,10 +3704,11 @@ impl Em {
                     format!("(uint64_t)((int64_t)(int){} * (int64_t)(int){})", lo_hi[0].0, lo_hi[1].0)
                 };
                 self.line(&format!("uint64_t {t}_p = {p}; uint64_t {t}_c = {};", u64v(2)));
-                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c;"));
+                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c; uint {t}_wl = (uint){t}_w, {t}_wh = (uint)({t}_w >> 32);"));
+                let (cl, ch) = (&lo_hi[2].0, &lo_hi[2].1);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
-                self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
-                self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
+                self.write_mask(&sdst, &format!("({t}_wh < ({ch}) || ({t}_wh == ({ch}) && {t}_wl < ({cl})))"));
+                self.write64(&dst, &format!("{t}_wl"), &format!("{t}_wh"));
                 return Ok(());
             }
             _ => {
@@ -3020,7 +3719,7 @@ impl Em {
                     "v_fma_f64" => format!("fma({}, {}, {})", f64v(0), f64v(1), f64v(2)),
                     "v_min_f64" => format!("min({}, {})", f64v(0), f64v(1)),
                     "v_max_f64" => format!("max({}, {})", f64v(0), f64v(1)),
-                    "v_rcp_f64" => format!("(1.0 / {})", f64v(0)),
+                    "v_rcp_f64" => format!("rcp_d({})", f64v(0)),
                     "v_cvt_f64_f32" => format!("(double)asfloat({})", lo_hi[0].0),
                     "v_cvt_f64_i32" => format!("(double)(int){}", lo_hi[0].0),
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
@@ -3030,7 +3729,7 @@ impl Em {
                     "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
                     "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
                     "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
-                    "v_rsq_f64" => format!("((double)1 / sqrt_d({}))", f64v(0)),
+                    "v_rsq_f64" => format!("rcp_d(sqrt_d({}))", f64v(0)),
                     "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
                     "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
@@ -3096,6 +3795,9 @@ impl Em {
         let mix = name.starts_with("v_fma_mix");
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
+        }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
         }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
@@ -3228,6 +3930,9 @@ impl Em {
             "v_ceil_f32" => fr(format!("ceil({})", fs(0))),
             "v_rndne_f32" => fr(format!("round({})", fs(0))),
             "v_frexp_mant_f32" => fr(format!("frexp_mant({})", fs(0))),
+            "v_frexp_exp_i32_f32" if self.track_frexp_denorm => {
+                format!("(uint)frexp_exp_f32({a}, {}, xcl_frexp_f32_denorm)", fs(0))
+            }
             "v_frexp_exp_i32_f32" => format!("(uint)frexp_exp({})", fs(0)),
             "v_ldexp_f32" => fr(format!("ldexp_f({}, (int){b})", fs(0))),
             "v_add_f32" => fr(format!("{} + {}", fs(0), fs(1))),
@@ -3382,12 +4087,19 @@ impl Em {
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                // (a live lane of EXEC where there is one: `first_lane_live`)
+                self.line(&format!("uint {t} = {rla}({a}, first_lane_live({el}, {eh}));"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
+                // the end of a whole-wave reduction (`wave32_reductions`)
+                if let Some((seed, op)) = self.reductions.reads.get(&d.pc) {
+                    self.line(&format!("uint {t} = xcl_red_{op}(xcl_seed_{seed:x});"));
+                    self.write32(&dst, &t);
+                    return Ok(());
+                }
                 let rla = self.rla_uniform_fn();
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
                 // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
@@ -3561,7 +4273,6 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -3569,9 +4280,19 @@ impl Em {
         let op = op.trim_end_matches("_x2");
         let bytes = if x2 { 8 } else { 4 };
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            self.line(&format!("uint {t}_a = (uint){t}_ea & ~{}u;", bytes - 1));
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+        }
         let act = self.act();
         if x2 {
             return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
@@ -3610,14 +4331,30 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
-        let ok = format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})");
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            if store {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        }
+        let ok = if self.opt.mem_windows > 1 {
+            format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
+        } else {
+            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
+        };
         let act = self.act();
         let v = self.vreg(vdata);
         if store {
@@ -3642,14 +4379,11 @@ impl Em {
         }
         if let Some((n, signed, store, half)) = flat_small(op) {
             let global = d.enc.name == "ENC_FLAT_GLBL";
-            let addr = self.vreg(f("ADDR"));
             let saddr = f("SADDR");
-            let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-            self.flat_window(global, saddr, f("ADDR"));
             let raw = f("OFFSET") as u32;
             let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
             let t = self.t();
-            self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+            self.emit_flat_addr(global, false, saddr, f("ADDR"), off, 0, store, &t);
             let act = self.act();
             if store {
                 let v = self.vreg(f("DATA"));
@@ -3676,26 +4410,10 @@ impl Em {
         };
         let global = d.enc.name == "ENC_FLAT_GLBL";
         let saddr = f("SADDR");
-        let base = if op.ends_with("_addtid") {
-            // EA = SADDR ("off"/null sentinel → 0) + 4 * lane index + signed OFFSET
-            match saddr {
-                0x7D | 0x7F => "4u * lane_id".to_string(),
-                _ => format!("{} + 4u * lane_id", self.sreg(saddr)),
-            }
-        } else {
-            let addr = self.vreg(f("ADDR"));
-            if global && saddr != 0x7D && saddr != 0x7F {
-                let s = self.sreg(saddr);
-                format!("{s} + {addr}")
-            } else {
-                addr
-            }
-        };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
-        self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+        self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
         let mut st = Vec::new();
         for i in 0..count {
@@ -3760,16 +4478,13 @@ impl Em {
     fn flat_atomic(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let global = d.enc.name == "ENC_FLAT_GLBL";
-        let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
-        let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
-        self.line(&format!("uint {t}_a = ({base} + {}) & ~{}u;", hex(off), if x2 { 7 } else { 3 }));
+        self.emit_flat_addr(global, false, saddr, f("ADDR"), off, if x2 { 7 } else { 3 }, true, &t);
         let act = self.act();
         if x2 {
             let data = f("DATA");
@@ -3861,15 +4576,22 @@ impl Em {
             Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
             _ => false,
         };
+        // GDS=1: the access goes to the global data share, a separate memory, not the group's LDS
+        if f("GDS") != 0 {
+            return Err("GDS");
+        }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
-            if f("GDS") != 0 {
-                return Err("GDS");
-            }
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
-            let slot = if self.x64() { format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]") } else { format!("xcl_lds[(({at}) >> 2) & 8191u]") };
+            let slot = if self.x64() {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+            } else if self.safe_barrier {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+            } else {
+                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+            };
             if name == "ds_write_addtid_b32" {
                 let src = self.vreg(f("DATA0"));
                 self.line(&format!("if ({act}) {{ {slot} = {src}; }}"));
@@ -3887,10 +4609,18 @@ impl Em {
         let addr = self.vreg(f("ADDR"));
         let a = format!("{t}_ad");
         self.line(&format!("uint {a} = {addr};"));
-        // split wave64: the exchange lives in the top of the LDS block (`XCL_X_LDS_TOP` = the
-        // last dword below it)
+        // split wave64 / safe_barrier: runtime state lives in the top of the LDS block
         let x64 = self.x64();
-        let lds = |at: String| if x64 { format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]") } else { format!("xcl_lds[(({at}) >> 2) & 8191u]") };
+        let safe_bar = self.safe_barrier;
+        let lds = |at: String| {
+            if x64 {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+            } else if safe_bar {
+                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+            } else {
+                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+            }
+        };
         let mut st = Vec::new();
         let rw = |n: &str| -> Option<(bool, u64, u64, bool)> {
             // (write?, dwords per element, stride of offsets (bytes), two elements?)
@@ -4028,10 +4758,12 @@ impl Em {
         }
     }
 
-    /// Split wave64: whether the pairs meet through arrival counters (several console waves
-    /// per group, or `XCL_WAVE64_SPIN` for testing) instead of group barriers.
+    /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
+    /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
+    /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
+    /// for 1-wave64 groups.
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var_os("XCL_WAVE64_SPIN").is_some()
+        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
@@ -4051,9 +4783,11 @@ impl Em {
         let (slots, counters) = (waves * 4 * slot, waves * 2);
         let _ = writeln!(h, "#define XCL_X_THREADS {threads}u\n#define XCL_X_WAVES {waves}u\n#define XCL_X_SLOT {slot}u\n#define XCL_X_SPIN {}", self.x64_spin() as u32);
         if self.x64_lds() {
-            // the D3D12 limit (32 KB) is the whole block already: the exchange takes its top,
-            // the program's LDS accesses stop below it (`XCL_X_LDS_TOP`)
-            let base = 8192 - slots - counters - 1;
+            // the D3D12 limit (32 KB) is the whole block already: the exchange (and optional
+            // safe-barrier words at 8189..8190) takes its top, the program's LDS accesses stop
+            // below it (`XCL_X_LDS_TOP`)
+            let bar_words = if self.safe_barrier { 2 } else { 0 };
+            let base = 8192 - slots - counters - 1 - bar_words;
             h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB); the top holds the wave64 exchange\n");
             let _ = writeln!(h, "#define XCL_X_LDS_TOP {}u", base - 1);
             let _ = writeln!(h, "#define XCL_XS(i) xcl_lds[{base}u + (i)]\n#define XCL_XC(i) xcl_lds[{}u + (i)]\n#define XCL_XW xcl_lds[8191u]", base + slots);
@@ -4062,6 +4796,21 @@ impl Em {
             h.push_str("#define XCL_XS(i) xcl_xs[(i)]\n#define XCL_XC(i) xcl_xc[(i)]\n#define XCL_XW xcl_xw\n");
         }
         h.push_str(PRELUDE_X64);
+    }
+
+    /// Storage and functions for early-exit-safe, bounded `s_barrier` (`PRELUDE_SAFE_BARRIER`).
+    fn safe_barrier_prelude(&self, h: &mut String) {
+        if !self.safe_barrier {
+            return;
+        }
+        if self.x64_lds() {
+            h.push_str("#define XCL_BAR_ALIVE xcl_lds[8189u]\n#define XCL_BAR_STATE xcl_lds[8190u]\n");
+        } else if !self.x64() && self.uses_lds {
+            h.push_str("#define XCL_LDS_TOP 8188u\n#define XCL_BAR_ALIVE xcl_lds[8189u]\n#define XCL_BAR_STATE xcl_lds[8190u]\n");
+        } else {
+            h.push_str("groupshared uint xcl_bar_alive_g;\ngroupshared uint xcl_bar_state_g;\n#define XCL_BAR_ALIVE xcl_bar_alive_g\n#define XCL_BAR_STATE xcl_bar_state_g\n");
+        }
+        h.push_str(PRELUDE_SAFE_BARRIER);
     }
 
     /// Split wave64, at the start of `main`: the console thread this thread stands for
@@ -4081,15 +4830,17 @@ impl Em {
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-        let windows = self.opt.mem_windows.clamp(1, 4);
+        // memory coherent across the GPU only when the program actually uses those; otherwise
+        // keep the cached (faster) view
+        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
+        let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+        let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows {
+            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
-            h.push_str("static uint xcl_w = 0u;\n");
+            h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
@@ -4100,6 +4851,12 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
+        if matches!(self.opt.mode, Mode::Pixel(_)) {
+            h.push_str(PRELUDE_PIXEL);
+        }
+        if !self.reductions.reads.is_empty() {
+            h.push_str(PRELUDE_REDUCE);
+        }
         if self.x64() {
             self.x64_prelude(&mut h);
         }
@@ -4119,9 +4876,18 @@ impl Em {
         if self.dynamic_f16_rm {
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
         }
+        if self.track_frexp_denorm {
+            h.push_str("static uint xcl_frexp_f32_denorm = 0u;\n");
+        }
+        for s in &self.img_writes {
+            let _ = writeln!(h, "static uint xcl_iw{s} = 0u; // tw0 + 1 of the last image store / atomic through s{s}");
+        }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
         let load_sgprs = |h: &mut String| {
+            if windows > 1 {
+                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+            }
             for &c in &sg {
                 let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
             }
@@ -4233,10 +4999,14 @@ impl Em {
                         h.push_str("groupshared uint xcl_wt;\n#define XCL_WT xcl_wt\n");
                     }
                 }
+                self.safe_barrier_prelude(&mut h);
                 let _ = writeln!(
                     h,
                     "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_init(gi);\n");
+                }
                 if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
@@ -4278,6 +5048,9 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_exit();\n");
+                }
                 h.push_str("}\n");
             }
             Mode::Mesh(ms) => {
@@ -4287,8 +5060,12 @@ impl Em {
                 if self.uses_lds && !self.x64_lds() {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
+                self.safe_barrier_prelude(&mut h);
                 let t = ms.threads;
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_init(gi);\n");
+                }
                 if self.x64() {
                     // the console thread's index (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
@@ -4311,6 +5088,9 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_exit();\n");
+                }
                 h.push_str("}\n");
             }
             Mode::Geometry(g) => {
@@ -4486,13 +5266,18 @@ impl Em {
                         65 => h.push_str("    float xcl_depth : SV_Depth;\n"),
                         67 => h.push_str("    float xcl_depth : SV_DepthGreaterEqual;\n"),
                         68 => h.push_str("    float xcl_depth : SV_DepthLessEqual;\n"),
+                        66 if self.ps_writes_mask => h.push_str("    uint xcl_mask : SV_Coverage;\n"),
                         _ => {}
                     }
                 }
-                if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
+                if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
+                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                if self.ps_writes_mask {
+                    h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
+                }
+                h.push_str("    bool xcl_live = false;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
@@ -4526,7 +5311,8 @@ impl Em {
             }
         }
         if windows > 1 {
-            h = windowed(&h, windows);
+            let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
+            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h
     }
@@ -4661,8 +5447,13 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(fill, "        o.p{k} = {v};");
     }
     let tri_base = MESH_HEADER + mv as usize * vd;
+    // The declaration is chosen by the vertex budget, the dispatch group count separately:
+    // a record over the budget in whole vertices can still fit one compact group (its few
+    // triangles' own copies fit) – declaring verts[mv] there is refused by DXC (80 vertices
+    // with 22 float4 rows are accounted as 96: 33792 B > 32768).
+    let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
     let split = passthrough_split(ms, elems.len());
-    if split == 1 {
+    if mv <= cap {
         let _ = writeln!(
             h,
             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
@@ -4676,7 +5467,9 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         h.push_str("        verts[i] = o;\n    }\n");
         let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
-        h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+        // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
+        // per-edge flags at [9], [19], [29] and null_prim at [31].
+        h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
@@ -4695,7 +5488,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
-    h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+    h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
     h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
     h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
@@ -4708,15 +5501,28 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
 /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
 const MESH_OUTPUT_BYTES: u32 = 32768;
 
-/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
-/// mesh output limit as they are, else the triangles are split into runs whose own vertex
-/// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
+/// Vertices the pass-through puts in one mesh group: the vertex output budget divided by the
+/// stride, and DXC accounts whole chunks of 32 vertices even when fewer are declared (78
+/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): the
+/// formula gives DXC's exact boundary for 1 to 32 float4 rows, up to 256 primitives
+/// (NathanTheophile's 96-case bisect in this PR); narrower clip/cull rows count as full rows
+/// here, which can only overestimate.
+fn passthrough_max_vertices(vbytes: u32) -> u32 {
+    (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
+}
+
+/// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
+/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
+/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
+/// this count is the dispatch's, and one compact group can carry a record whose whole
+/// declaration would be refused. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
+    let cap = passthrough_max_vertices(vbytes);
+    if ms.max_vertices <= cap {
         return 1;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
+    let ppg = (cap / 3).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
@@ -4827,11 +5633,26 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "swap" | "wrxchg_b32" => direct("InterlockedExchange", v),
         "umin" | "min_u32" => direct("InterlockedMin", v),
         "umax" | "max_u32" => direct("InterlockedMax", v),
-        // float compare-swap compares bits (differs only for -0 / NaN)
-        "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => match at {
+        "cmpswap" | "cmpst_b32" => match at {
             At::Mem(a) => format!("mem.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
             At::Ref(r) => format!("InterlockedCompareExchange({r}, {v2}, {v}, {old});"),
         },
+        // IEEE-754 float compare-swap: -0.0 == +0.0 swaps, NaN == NaN keeps (XCL-BT-042)
+        "fcmpswap" | "cmpst_f32" => {
+            let (load, cx) = match at {
+                At::Mem(a) => (
+                    format!("mem.InterlockedOr({a}, 0u, {t}_c);"),
+                    format!("mem.InterlockedCompareExchange({a}, {t}_c, {v}, {t}_p);"),
+                ),
+                At::Ref(r) => (
+                    format!("InterlockedOr({r}, 0u, {t}_c);"),
+                    format!("InterlockedCompareExchange({r}, {t}_c, {v}, {t}_p);"),
+                ),
+            };
+            format!(
+                "uint {t}_c = 0u; {load} [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFu) > 0x7F800000u || ({t}_c != {v2} && (({t}_c | {v2}) & 0x7FFFFFFFu) != 0u)) break; uint {t}_p = 0u; {cx} if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+            )
+        }
         "smin" | "min_i32" => signed("InterlockedMin", "min"),
         "smax" | "max_i32" => signed("InterlockedMax", "max"),
         "fmin" | "fmax" | "min_f32" | "max_f32" => {
@@ -4877,9 +5698,13 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
             let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
             return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
         }
-        // float compare-swap compares the whole 64-bit payload bitwise (like rmw32's
-        // fcmpswap): differs from a numeric f64 compare only for -0 / NaN
-        "cmpswap" | "fcmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        // IEEE-754 f64 compare-swap via pure u64 bitwise checks (no DoubleExtensions needed)
+        "fcmpswap" => {
+            return Some(format!(
+                "uint64_t {t}_c = 0; mem.InterlockedOr64({a}, (uint64_t)0, {t}_c); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull || ({t}_c != {cmp} && (({t}_c | {cmp}) & 0x7FFFFFFFFFFFFFFFull) != 0ull)) break; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {v}, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+            ));
+        }
         "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, a, v, old, t)),
         _ => return None,
     };
@@ -4915,7 +5740,9 @@ const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Lo
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
 /// definitions replace the placeholder.
-fn windowed(h: &str, windows: u32) -> String {
+/// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
+/// (`Options::heap_windows`) instead of switching over the root UAVs.
+fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -4933,47 +5760,73 @@ fn windowed(h: &str, windows: u32) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
-fn mem_accessors(windows: u32) -> String {
-    let mut sigs: Vec<(&str, String, &str, &str)> = vec![
-        ("uint", "Load".into(), "uint a", "a"),
-        ("uint2", "Load2".into(), "uint a", "a"),
-        ("uint3", "Load3".into(), "uint a", "a"),
-        ("uint4", "Load4".into(), "uint a", "a"),
-        ("void", "Store".into(), "uint a, uint v", "a, v"),
-        ("void", "Store2".into(), "uint a, uint2 v", "a, v"),
-        ("void", "Store3".into(), "uint a, uint3 v", "a, v"),
-        ("void", "Store4".into(), "uint a, uint4 v", "a, v"),
-        ("void", "InterlockedCompareExchange".into(), "uint a, uint c, uint v, out uint o", "a, c, v, o"),
-        ("void", "InterlockedCompareExchange64".into(), "uint a, uint64_t c, uint64_t v, out uint64_t o", "a, c, v, o"),
+/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
+/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
+/// out-of-UMA pointers can never wrap onto live memory windows.
+/// `heap`: Some(storage class) – window k is taken from the descriptor heap
+/// (`Options::heap_windows`) and the same rule is one comparison before the access.
+fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+    let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
+        ("uint", "Load".into(), "uint a", "a", "return 0u;"),
+        ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
+        ("uint3", "Load3".into(), "uint a", "a", "return uint3(0u, 0u, 0u);"),
+        ("uint4", "Load4".into(), "uint a", "a", "return uint4(0u, 0u, 0u, 0u);"),
+        ("void", "Store".into(), "uint a, uint v", "a, v", "break;"),
+        ("void", "Store2".into(), "uint a, uint2 v", "a, v", "break;"),
+        ("void", "Store3".into(), "uint a, uint3 v", "a, v", "break;"),
+        ("void", "Store4".into(), "uint a, uint4 v", "a, v", "break;"),
+        ("void", "InterlockedCompareExchange".into(), "uint a, uint c, uint v, out uint o", "a, c, v, o", "o = 0u; break;"),
+        ("void", "InterlockedCompareExchange64".into(), "uint a, uint64_t c, uint64_t v, out uint64_t o", "a, c, v, o", "o = (uint64_t)0; break;"),
     ];
     for op in ["Add", "And", "Or", "Xor", "Exchange", "Min", "Max"] {
-        sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v, out uint o", "a, v, o"));
+        sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v, out uint o", "a, v, o", "o = 0u; break;"));
         if op != "Exchange" {
-            sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v"));
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v", "break;"));
         }
-        sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o"));
+        sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o", "o = (uint64_t)0; break;"));
         if op == "Min" || op == "Max" {
-            sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o"));
-            sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o"));
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o", "o = 0; break;"));
+            sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
     }
     let mut s = String::new();
+    if let Some(coherent) = heap {
+        // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
+        // does what the switch's `default` does
+        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, def) in sigs {
+            let r = if ret == "void" { "" } else { "return " };
+            // (the switch's `break` leaves the accessor)
+            let outside = def.replace("break;", "return;");
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+        }
+        return s;
+    }
     let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
     for k in 1..windows {
         let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
     }
-    let _ = writeln!(s, "default: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }} }}");
-    for (ret, name, params, args) in sigs {
-        let r = if ret == "void" { "" } else { "return " };
+    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
+    for (ret, name, params, args, def) in sigs {
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
-        for k in 1..windows {
-            let _ = write!(s, "case {k}u: {r}mem{k}.{name}({args}); break; ");
+        if ret == "void" {
+            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
+            for k in 1..windows {
+                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
+            }
+        } else {
+            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
+            for k in 1..windows {
+                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+            }
         }
-        let _ = writeln!(s, "default: {r}mem.{name}({args}); break; }} }}");
+        let _ = writeln!(s, "default: {def} }} }}");
     }
     s
 }
@@ -5065,9 +5918,16 @@ uint4 ld_raw(uint a) {
 }
 // format helpers: no loops, no branches (inlined at every buffer access; `?:` and `if`
 // on scalars become control flow in HLSL 2021, which DXC is slow to clean up)
+uint pick4(uint4 v, uint i) {
+    return select(i == 0u, v.x, select(i == 1u, v.y, select(i == 2u, v.z, v.w)));
+}
+void or_at4(inout uint4 r, uint i, uint v) {
+    r.x |= select(i == 0u, v, 0u); r.y |= select(i == 1u, v, 0u);
+    r.z |= select(i == 2u, v, 0u); r.w |= select(i == 3u, v, 0u);
+}
 uint bits_at(uint4 r, uint off, uint w) {
     uint i = off >> 5; uint s = off & 31u;
-    uint lo = r[i]; uint hi = select(i < 3u, r[min(i + 1u, 3u)], 0u);
+    uint lo = pick4(r, i); uint hi = select(i < 3u, pick4(r, min(i + 1u, 3u)), 0u);
     uint v = select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u)));
     return select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u));
 }
@@ -5130,9 +5990,11 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         return uint4(id[0], id[1], id[2], id[3]);
     }
     if (type <= 3u) {
-        // GPURT gfx10 node: a pair of triangles, type 0 = (v0, v1, v2), type 1 = (v1, v3, v2)
-        bool t1 = type == 1u;
-        float3 v0 = asfloat(mem.Load3(at + (t1 ? 12u : 0u))), v1 = asfloat(mem.Load3(at + (t1 ? 36u : 12u))), v2 = asfloat(mem.Load3(at + 24u));
+        // GPURT gfx10 node: up to four triangles across 5 vertices: 0=(0,1,2), 1=(1,3,2), 2=(2,3,4), 3=(2,4,0)
+        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
+        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
+        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
         float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
@@ -5140,9 +6002,9 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
         bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
-        float bc[4] = { det - i - j, i, j, 0.0f };
+        uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
-        return hit ? uint4(asuint(t), asuint(det), asuint(bc[tid & 3u]), asuint(bc[(tid >> 2) & 3u])) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+        return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
@@ -5150,9 +6012,10 @@ uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;
-    r[i] |= v << s;
-    if (s != 0u && s + w > 32u && i < 3u) r[i + 1u] |= v >> (32u - s);
+    or_at4(r, i, v << s);
+    if (s != 0u && s + w > 32u && i < 3u) or_at4(r, i + 1u, v >> (32u - s));
 }
+uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
     float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
@@ -5161,11 +6024,17 @@ uint fmt_encode(uint x, uint info, uint c) {
     if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
-    if (ty == 4u || ty == 5u || w == 32u) return x;
-    if (w == 16u) return f32tof16(f);
+    if (ty == 4u) return w >= 32u ? x : min(x, (1u << w) - 1u);
+    if (ty == 5u) {
+        if (w >= 32u) return x;
+        int hi = (int)((1u << (w - 1u)) - 1u);
+        return (uint)clamp((int)x, -hi - 1, hi);
+    }
+    if (w == 32u) return x;
+    if (w == 16u) return f16_rtz(f);
     if (isnan(f)) return w == 11u ? 0x7E0u : 0x3F0u;
     if (f <= 0.0f) return 0u;
-    uint h = f32tof16(f);
+    uint h = f16_rtz(f);
     return w == 11u ? ((h >> 4) & 0x7FFu) : ((h >> 5) & 0x3FFu);
 }
 uint4 fmt_pack(uint4 v, uint info) {
@@ -5181,7 +6050,7 @@ void st_bytes(uint a, uint4 r, uint n) {
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
-uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
@@ -5283,6 +6152,142 @@ uint2 xcl_x_ballot_local(bool b) {
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
 
+/// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
+///
+/// On RDNA2, `S_ENDPGM` decrements the CU's active wave count so remaining waves executing
+/// `S_BARRIER` never wait for already-exited waves. On PC D3D12/NVIDIA, `GroupMemoryBarrierWithGroupSync()`
+/// compiles to `bar.sync 0`, which waits for every warp in the CTA forever if any warp exits early
+/// (`s_endpgm`), exhausts `xcl_budget` (`LOOP_GUARD`), or diverges after a split-wave64 desync.
+///
+/// `XCL_BAR_ALIVE` counts live warps (decremented once on exit); `XCL_BAR_STATE` packs
+/// `(gen: 20 bits, arrived: 12 bits)` so advancing `gen` atomically resets `arrived = 0`.
+const PRELUDE_SAFE_BARRIER: &str = r#"
+static bool xcl_bar_alive = true;
+void xcl_s_barrier_init(uint gi) {
+    if (gi == 0u) { XCL_BAR_ALIVE = 0u; XCL_BAR_STATE = 0u; }
+    GroupMemoryBarrierWithGroupSync();
+    if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_BAR_ALIVE, 1u, _o); }
+    GroupMemoryBarrierWithGroupSync();
+}
+void xcl_s_barrier_exit() {
+    if (xcl_bar_alive) {
+        xcl_bar_alive = false;
+        uint _act = WaveActiveCountBits(true);
+        if (WaveIsFirstLane() && _act != 0u) {
+            uint _o;
+            InterlockedAdd(XCL_BAR_ALIVE, 0xFFFFFFFFu, _o);
+        }
+    }
+}
+void xcl_s_barrier() {
+    if (!xcl_bar_alive) { GroupMemoryBarrier(); return; }
+    GroupMemoryBarrier();
+    uint _lanes = WaveActiveCountBits(true);
+    uint _ok = 1u;
+    if (WaveIsFirstLane() && _lanes != 0u) {
+        uint _old;
+        InterlockedAdd(XCL_BAR_STATE, 1u, _old);
+        uint _gen = _old >> 12;
+        uint _next = ((_gen + 1u) & 0xFFFFFu) << 12;
+        [loop] for (uint _n = 0u; ; _n++) {
+            uint _s, _alive;
+            InterlockedAdd(XCL_BAR_STATE, 0u, _s);
+            if ((_s >> 12) != _gen) break;
+            InterlockedAdd(XCL_BAR_ALIVE, 0u, _alive);
+            if ((int)_alive <= 0 || (_s & 0xFFFu) >= _alive) {
+                uint _orig;
+                InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
+                if (_orig == _s) break;
+            }
+            if (_n >= (1u << 20)) {
+                _ok = 0u;
+                uint _orig;
+                InterlockedAdd(XCL_BAR_ALIVE, 0xFFFFFFFFu, _orig);
+                InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
+                break;
+            }
+        }
+    }
+    if (WaveReadLaneFirst(_ok) == 0u) xcl_bar_alive = false;
+    GroupMemoryBarrier();
+}
+"#;
+
+/// Whole-wave reductions of wave32 VS / PS programs (`wave32_reductions`). The console's combine
+/// the lanes through DPP and permlane steps that pass partial results through lanes that were
+/// never launched (`s_or_saveexec -1` runs them); here those lanes do not exist and the steps
+/// read 0 from them, so a wave that is not full lost the words of live lanes. The lanes of each
+/// half of a 64-lane wave are a console wave of their own. A helper lane is in no wave
+/// operation and gets the result of a live lane of its quad (every quad has one).
+const PRELUDE_REDUCE: &str = r#"
+uint xcl_red_share(uint r) {
+#ifdef XCL_PIXEL
+    uint hw = WaveGetLaneIndex();
+    uint nib = (WaveActiveBallot(true)[hw >> 5] >> (hw & 28u)) & 15u;
+    uint q0 = QuadReadLaneAt(r, 0u), q1 = QuadReadLaneAt(r, 1u), q2 = QuadReadLaneAt(r, 2u), q3 = QuadReadLaneAt(r, 3u);
+    uint k = firstbitlow(nib);
+    r = (k & 2u) != 0u ? ((k & 1u) != 0u ? q3 : q2) : ((k & 1u) != 0u ? q1 : q0);
+#endif
+    return r;
+}
+uint xcl_red_or(uint x) {
+    uint a = WaveActiveBitOr(select(xcl_half == 0u, x, 0u)), b = WaveActiveBitOr(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_max(uint x) {
+    uint a = WaveActiveMax(select(xcl_half == 0u, x, 0u)), b = WaveActiveMax(select(xcl_half == 0u, 0u, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_and(uint x) {
+    uint a = WaveActiveBitAnd(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveBitAnd(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+uint xcl_red_min(uint x) {
+    uint a = WaveActiveMin(select(xcl_half == 0u, x, 0xFFFFFFFFu)), b = WaveActiveMin(select(xcl_half == 0u, 0xFFFFFFFFu, x));
+    return xcl_red_share(select(xcl_half == 0u, a, b));
+}
+"#;
+
+/// Pixel shaders: masks hold the helper lanes (#105). After `s_wqm` the helper pixels of a
+/// quad a primitive's edge splits are in EXEC and the console's `v_cmp*` / carries set their
+/// bits like any other lane's; wave ops leave helper lanes out before SM 6.7 (their ballot bits
+/// are 0), quad ops do not. The entry EXEC stays `ballot(true)` – the live lanes, without the
+/// helper lanes, as on the console, which returns to it after `s_wqm` (with the helper lanes
+/// in it they never stop: `[WaveOpsIncludeHelperLanes]` hung the device that way).
+const PRELUDE_PIXEL: &str = r#"
+// every lane gets its quad's four bits through quad reads (they see helper lanes); ballot p
+// collects bit p of them from the live lanes, and any live lane of a quad (every quad has one)
+// answers for its member p. Only ballots and quad reads: a helper lane gets the wave's result
+// of a ballot, not of every wave op (WaveActiveBitOr gives it another value on an RTX 5070 Ti),
+// and each lane holds its own copy of EXEC – a helper lane's must be right as well.
+// (bit p of q: the quad's member p). In a loop the translator gives q from quad reads of the
+// compare's vector operands, not of its result (`quad_bits`: AMD's compiler crashed on those,
+// #134); elsewhere ballot_px quad-reads the result.
+uint2 ballot_px_quad(uint q) {
+    uint2 m = uint2(0u, 0u);
+    [unroll] for (uint p = 0u; p < 4u; p++) {
+        uint2 w = WaveActiveBallot(((q >> p) & 1u) != 0u).xy;
+        w |= w >> 1;
+        w |= w >> 2;
+        m |= (w & 0x11111111u) << p;
+    }
+    return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
+}
+uint2 ballot_px(bool b) {
+    uint own = (uint)b << (WaveGetLaneIndex() & 3u);
+    return ballot_px_quad(own | QuadReadAcrossX(own) | QuadReadAcrossY(own) | QuadReadAcrossDiagonal(own));
+}
+// a mask only ever read lane by lane (v_cndmask, carry-ins; `x64_masks`): the wave's ballot
+// with the reading lane's own bit, which a helper lane has too
+uint2 ballot_px_local(bool b) {
+    uint hw = WaveGetLaneIndex();
+    uint4 w = WaveActiveBallot(b);
+    uint own = (uint)b << (hw & 31u);
+    uint2 m = uint2(w.x | select(hw < 32u, own, 0u), w.y | select(and(hw >= 32u, hw < 64u), own, 0u));
+    return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
+}
+"#;
+
 const PRELUDE: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
@@ -5360,6 +6365,35 @@ float3 cube_dir(float s, float t, float face) {
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
+// The lane a v_readfirstlane reads. In a pixel shader EXEC holds helper lanes (s_wqm) and its
+// first lane is often one, on a primitive's edge. A helper lane's registers cannot be read once
+// a loop has run a wave op: AMD's RDNA2 driver (RX 6700 XT) gives 0 for everything a helper
+// lane holds after a WaveReadLaneAt inside a loop, quad reads included. A loop whose state the
+// console's compiler carries in a vector (v_mov v, s … v_readfirstlane s, v) then read 0 back
+// each time round and ran to the loop budget: a retail volumetric light pass took seconds a draw
+// and the GPU was reset. So the first live lane of EXEC is read if EXEC has one. The value
+// is the same there: the console's compiler reads the first lane of values that are equal in
+// every lane, or of any lane it then removes from EXEC (a waterfall loop).
+// "Is a lane left" of a lane mask in a pixel shader, over the live lanes. AMD's RDNA2 driver
+// (RX 6700 XT) also stops keeping a helper lane's registers at a loop's back edge when the
+// shader has another loop before it: from the second pass on, everything a helper lane holds
+// reads as 0. A loop that goes on as long as lanes are left in a mask (s_andn2 mask, mask, EXEC;
+// s_cbranch_scc1) then kept a helper lane's bit, whose "done" condition comes from registers
+// that no longer change, and ran to the loop budget (a retail volumetric light pass took seconds
+// a draw and the GPU was reset). The helper lanes leave with the live ones.
+uint mask_live(uint m) {
+#ifdef XCL_PIXEL
+    m &= ballot(true).x;
+#endif
+    return m;
+}
+uint first_lane_live(uint lo, uint hi) {
+#ifdef XCL_PIXEL
+    uint2 lv = ballot(true);
+    if (((lo & lv.x) | (hi & lv.y)) != 0u) { lo &= lv.x; hi &= lv.y; }
+#endif
+    return first_lane(lo, hi);
+}
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
@@ -5368,6 +6402,7 @@ uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
 uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
+uint pk_sad_u16(uint d0, uint d1, uint acc, bool sat) { uint s0 = (acc & 0xFFFFu) + d0; uint s1 = (acc >> 16) + d1; return select(sat, min(s0, 0xFFFFu), s0 & 0xFFFFu) | (select(sat, min(s1, 0xFFFFu), s1 & 0xFFFFu) << 16); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
@@ -5432,7 +6467,6 @@ uint perm_b32(uint s0, uint s1, uint sel) {
     }
     return r;
 }
-uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 // Exact binary16 → unorm16/snorm16 (round-to-nearest-even, NaN → 0, ±Inf/≥1 → ±scale, subnormals exact).
 // Avoids fp32 double-rounding (e.g. 0x3801 * 65535 = 32799.4995 → 32799, not 32800) and DXIL clamp(NaN).
 uint cvt_norm_f16(uint h, uint scale) {
@@ -5459,8 +6493,19 @@ uint cvt_norm_i16_f16(uint h) {
 uint cvt_norm_i16_f32(float f) {
     return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
 }
-float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
+// HLSL frexp()'s mantissa is unsigned; the ISA's keeps the input's sign (as frexp_mant_d)
+float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : asfloat(asuint(frexp(x, e)) | (asuint(x) & 0x80000000u)); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
+int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
+    // 0: initial MODE unknown, 1: flush input, 2: preserve input.
+    if (denorm == 0u) return frexp_exp(legacy_src);
+    uint exp = (bits >> 23u) & 0xFFu;
+    if (exp == 0xFFu) return 0;
+    if (exp != 0u) return (int)exp - 126;
+    uint fraction = bits & 0x7FFFFFu;
+    if (fraction == 0u || denorm == 1u) return 0;
+    return (int)firstbithigh(fraction) - 148;
+}
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
 float ldexp_f(float x, int n) {
@@ -5561,6 +6606,19 @@ double sqrt_d(double x) {
     y = y + fma(-y, y, s) / (y + y);
     return ldexp_d(y, k);
 }
+// 1/x. DXC marks a plain divide fast (no NaN, no infinities), and a driver may then give 0 for
+// 1/NaN (RADV: v_rsq_f64 of a negative number was 0, not NaN). NaN, ±0 and ±inf are taken here.
+// The rest divides the mantissa (x scaled into [0.5, 1)), `precise`, and scales back with
+// ldexp_d, so a result below 2^-1022 is a denormal and not flushed to 0 (RADV: 1/DBL_MAX was 0).
+double rcp_d(double x) {
+    uint l, h; asuint(x, l, h);
+    if (isnan_d(x)) return x;
+    if (x == 0.0) return asdouble(0u, (h & 0x80000000u) | 0x7FF00000u);
+    if (isinf_d(x)) return asdouble(0u, h & 0x80000000u);
+    int e = frexp_exp_d(x);
+    precise double r = 1.0 / ldexp_d(x, -e);
+    return ldexp_d(r, -e);
+}
 // ±inf gives NaN, and NaN gives x
 double fract_d(double x) {
     if (isnan_d(x)) return x;
@@ -5613,3 +6671,18 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::PRELUDE_MEM;
+
+    #[test]
+    fn format_helpers_select_uint4_components_without_runtime_indexing() {
+        for indexed in ["r[i]", "r[i + 1u]", "c[(sel - 4u) & 3u]"] {
+            assert!(!PRELUDE_MEM.contains(indexed), "runtime vector index remains: {indexed}");
+        }
+        assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
+        assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
+        assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+}
