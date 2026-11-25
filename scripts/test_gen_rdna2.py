@@ -275,6 +275,20 @@ class GenRdna2CliTests(unittest.TestCase):
             self.assertIn("S_BRANCH", content)
             self.assertIn("V_FMAMK_F32", content)
 
+    def test_cli_reads_utf16_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "isa.xml"
+            source.write_text(SYNTHETIC_XML.replace('encoding="utf-8"', 'encoding="UTF-16"'), encoding="utf-16")
+            output = Path(tmp) / "spec.rs"
+            result = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), str(source), str(output)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected, _ = generate(SYNTHETIC_XML)
+            self.assertEqual(output.read_bytes(), expected.encode("utf-8"))
+
     def test_default_out_path_points_to_rdna2_spec(self):
         norm = Path(DEFAULT_OUT).resolve()
         self.assertEqual(norm.name, "rdna2_spec.rs")

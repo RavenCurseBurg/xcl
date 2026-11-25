@@ -197,9 +197,7 @@ def main(argv=None, dst=None):
     out_path = args[1] if len(args) > 1 else DEFAULT_OUT
 
     try:
-        with io.open(xml_path, "r", encoding="utf-8") as f:
-            src_text = f.read()
-        content, (arch, num_enc, num_prim, num_inst) = generate(src_text)
+        content, (arch, num_enc, num_prim, num_inst) = generate(ET.parse(xml_path))
     except ET.ParseError as e:
         print(f"error: invalid XML in '{xml_path}': {e}", file=sys.stderr)
         return 1
