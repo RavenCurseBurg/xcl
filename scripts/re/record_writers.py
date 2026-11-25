@@ -4,7 +4,9 @@ Per site: list register, bound field, record length, header (immediate or list f
 the vtable slot of the fallback call. Branch targets may have or omit the 0x prefix.
 
 usage: objdump -d --no-show-raw-insn XboxBvhBuilder.dll > bvhb.asm; python record_writers.py [-h] <bvhb.asm> [<bvhb.asm> ...]"""
+import codecs
 import collections
+import io
 import os
 import re
 import sys
@@ -103,8 +105,12 @@ def main(argv=None, out=None):
             has_error = True
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.read().splitlines()
+            with open(path, "rb") as raw:
+                # Windows PowerShell 5.1 redirects native output to UTF-16 with a BOM.
+                prefix = raw.peek(2)[:2]
+                encoding = "utf-16" if prefix in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE) else "utf-8-sig"
+                with io.TextIOWrapper(raw, encoding=encoding, errors="replace") as listing:
+                    lines = listing.read().splitlines()
             dump_record_writers(lines, file=out)
         except Exception as e:
             print(f"error: failed to read '{path}': {e}", file=sys.stderr)

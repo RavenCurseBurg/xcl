@@ -152,10 +152,10 @@ class CliHardeningTests(unittest.TestCase):
         self.assertIn("1 record write sites", out)
         self.assertIn("header imm 5678", out)
 
-    def test_main_function_programmatic(self):
+    def test_main_reads_utf8_and_bom_marked_listings(self):
         with tempfile.TemporaryDirectory() as tmp:
             listing = Path(tmp) / "prog.asm"
-            listing.write_text(
+            source = (
                 "   180001000: mov 0x18(%rcx),%rax\n"
                 "   180001004: cmp 0x30(%rcx),%rax\n"
                 "   180001008: jae 180001030\n"
@@ -163,14 +163,17 @@ class CliHardeningTests(unittest.TestCase):
                 "   180001010: add $0x20,%rax\n"
                 "   180001014: mov %rax,0x18(%rcx)\n"
                 "   180001018: ret\n"
-                "   180001030: call *0x40(%rbx)\n",
-                encoding="utf-8",
+                "   180001030: call *0x40(%rbx)\n"
             )
-            stdout = io.StringIO()
-            ret = record_writers.main([str(listing)], out=stdout)
-            self.assertEqual(ret, 0)
-            self.assertIn("1 record write sites", stdout.getvalue())
-            self.assertIn("header imm 9999", stdout.getvalue())
+            for encoding, bom in (("utf-8", b""), ("utf-8-sig", b""),
+                                  ("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")):
+                with self.subTest(encoding=encoding):
+                    listing.write_bytes(bom + source.encode(encoding))
+                    stdout = io.StringIO()
+                    ret = record_writers.main([str(listing)], out=stdout)
+                    self.assertEqual(ret, 0)
+                    self.assertIn("1 record write sites", stdout.getvalue())
+                    self.assertIn("header imm 9999", stdout.getvalue())
 
 
 if __name__ == "__main__":
