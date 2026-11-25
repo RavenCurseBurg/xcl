@@ -1,8 +1,10 @@
 import json
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -56,6 +58,20 @@ class CompareTests(unittest.TestCase):
         bad, notes = compare(self.baseline, r)
         self.assertEqual(bad, [])
         self.assertEqual(notes, ["MS: new stage in the sweep"])
+
+
+class GateCommandTests(unittest.TestCase):
+    def test_gate_sweep_enables_validation(self):
+        with TemporaryDirectory() as directory, patch("coverage_gate.subprocess.run") as run_sweep:
+            root = Path(directory)
+            xcl, pack = root / "xcl.exe", root / "shaders.rpf"
+            xcl.touch()
+            pack.touch()
+            run_sweep.return_value.stdout = json.dumps({"stages": STAGES})
+            run_sweep.return_value.stderr = ""
+            result = main(["--xcl", str(xcl), "--rpf", str(pack), "--update", "--baseline", str(root / "baseline.json")])
+            self.assertEqual(result, 0)
+            self.assertIn("--validate", run_sweep.call_args.args[0])
 
 
 class SweepJsonTests(unittest.TestCase):

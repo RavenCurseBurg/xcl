@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Direct-DXIL coverage baseline and gate.
 
-`xcl shaders <pack> --direct --sample 0 --json` sweeps every console program in a shader
-pack through the direct translator and prints per-stage outcome counts. Run that sweep (or
+`xcl shaders <pack> --direct --validate --sample 0 --json` sweeps every console program in a shader
+pack through the direct translator and validator, then prints per-stage outcome counts. Run that sweep (or
 hand in its saved JSON) and compare the counts against a committed baseline: a stage that
 translated fewer programs than the baseline, or gained validator failures, panicked or
 timed out, is a coverage regression - the class of bug a sibling project lost 323 shader
@@ -65,7 +65,7 @@ def main(argv=None):
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
-        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
+        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--validate", "--sample", "0", "--json"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
