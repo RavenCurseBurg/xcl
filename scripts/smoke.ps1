@@ -4,6 +4,10 @@
 #
 #   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
 #
+# Windows PowerShell 5.1 removes inherited empty XCL_NETWORK, XCL_RUN_SECONDS and XCL_ACTIVITY
+# values when it restores them. To preserve an empty value, run this script in a separate shell:
+#   powershell.exe -NoProfile -File .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle'
+#
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
