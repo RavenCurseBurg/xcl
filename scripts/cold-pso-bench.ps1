@@ -120,6 +120,9 @@ Write-Host "DXIL pass (not measured) into $dxil"
 $prep = Invoke-Xcl $common @{ XCL_DXIL_CACHE = $dxil }
 if ($prep.Exit -ne 0) { throw "the DXIL pass failed ($($prep.Exit)):`n$($prep.Out)" }
 
+# The next pass replaces timing files. Their old summary no longer describes this run.
+$summaryPath = Join-Path $Out 'summary.csv'
+if (Test-Path -LiteralPath $summaryPath -PathType Leaf) { Remove-Item -LiteralPath $summaryPath }
 $results = @()
 foreach ($n in $Threads) {
     $times = Join-Path $Out "times-$n.csv"
@@ -150,4 +153,4 @@ foreach ($r in $results) { "| $($r.threads) | $($r.wall_s) | $($r.cpu_s) | $($r.
 '| threads | DXIL size | made | driver s (sum) | p50 s | p95 s |'
 '|---:|---|---:|---:|---:|---:|'
 foreach ($r in $results) { foreach ($b in $r.buckets) { "| $($r.threads) | $($b.bucket) | $($b.made) | $($b.driver_s) | $($b.p50_s) | $($b.p95_s) |" } }
-$results | Select-Object threads, wall_s, cpu_s, peak_commit_mb, made, refused, reused, driver_s, p50_s, p95_s, max_s | Export-Csv -NoTypeInformation -LiteralPath (Join-Path $Out 'summary.csv')
+$results | Select-Object threads, wall_s, cpu_s, peak_commit_mb, made, refused, reused, driver_s, p50_s, p95_s, max_s | Export-Csv -NoTypeInformation -LiteralPath $summaryPath

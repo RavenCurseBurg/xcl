@@ -113,6 +113,7 @@ try {
     $cases += @{ Name = 'valid-[literal]-path'; Data = "$good`r`n"; Counts = @(1, 0, 0) }
     # XCL appends: reusing an output directory must remove its previous timings first.
     $cases += @{ Name = 'valid-literal-path-rerun'; OutName = 'valid-[literal]-path'; Data = "$good`r`n"; Counts = @(1, 0, 0) }
+    $cases += @{ Name = 'invalid-after-valid'; OutName = 'valid-[literal]-path'; Data = "bad row`r`n"; Line = 1 }
     $failures = New-Object 'System.Collections.Generic.List[string]'
     $passed = 0
     foreach ($case in $cases) {
