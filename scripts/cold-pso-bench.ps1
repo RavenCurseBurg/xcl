@@ -8,6 +8,7 @@
 # XCL's driver blobs off (XCL_PSO_DISK_CACHE=0) and the implicit D3D and driver shader caches off
 # (XCL_PIPELINE_CACHE_OFF=1, needs Windows Developer Mode). -ClearNvCache instead empties
 # %LOCALAPPDATA%\NVIDIA\DXCache before each run (it also drops other applications' entries).
+# Measured runs turn off the normal 8 MiB DXIL cap. Large programs can take minutes and gigabytes.
 # Every measured run starts a copy of -Xcl with a name of its own, next to it (the copy is removed
 # after the run): the AMD driver keys its shader cache on the exe's file name, so a second run of
 # the same name is served warm whatever was cleared (measured on RDNA4, #2129).
@@ -104,7 +105,9 @@ foreach ($n in $Threads) {
     $times = Join-Path $Out "times-$n.csv"
     Remove-Item $times -ErrorAction SilentlyContinue
     $vars = @{ XCL_DXIL_CACHE = $dxil; XCL_PSO_DISK_CACHE = '0'; XCL_PIPELINE_THREADS = "$n"; XCL_PIPELINE_TIMES = $times }
+    $vars.XCL_PIPELINE_MAX_KB = '0'
     if ($ClearNvCache) {
+        $vars.XCL_PIPELINE_CACHE_OFF = '0'
         $nv = Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'
         if (Test-Path $nv) { Get-ChildItem $nv -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
     } else {

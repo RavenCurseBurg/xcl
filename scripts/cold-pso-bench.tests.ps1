@@ -9,6 +9,7 @@ $null = New-Item -ItemType Directory -Path $fixture
 $savedAppData = $env:LOCALAPPDATA
 $savedTimes = $env:XCL_PIPELINE_TIMES
 $savedCacheOff = $env:XCL_PIPELINE_CACHE_OFF
+$savedMaxKb = $env:XCL_PIPELINE_MAX_KB
 try {
     # The fixture must never clear the user's driver cache or append to a real timing file.
     $env:LOCALAPPDATA = Join-Path $fixture 'local-appdata'
@@ -16,9 +17,11 @@ try {
     $null = New-Item -ItemType Directory -Path $cache
     $sentinel = Join-Path $cache 'sentinel'
     [IO.File]::WriteAllText($sentinel, 'temporary fixture cache')
-    Remove-Item Env:XCL_PIPELINE_TIMES, Env:XCL_PIPELINE_CACHE_OFF -ErrorAction SilentlyContinue
+    Remove-Item Env:XCL_PIPELINE_TIMES -ErrorAction SilentlyContinue
+    $env:XCL_PIPELINE_CACHE_OFF = '0'
+    $env:XCL_PIPELINE_MAX_KB = '8192'
     $xcl = Join-Path $fixture 'xcl.cmd'
-    # A pipelines run (XCL_PIPELINE_TIMES set) writes four builds and the environment it saw.
+    # A pipelines run writes the timings and child environment. The large row needs the cap off.
     [IO.File]::WriteAllText($xcl, (@(
         '@echo off'
         'if not defined XCL_PIPELINE_TIMES exit /b 0'
@@ -26,6 +29,7 @@ try {
         '>> "%XCL_PIPELINE_TIMES%" echo 0000000000000002,100000,made,0.5,300.0'
         '>> "%XCL_PIPELINE_TIMES%" echo 0000000000000003,2000000,made,0.0,5000.0'
         '>> "%XCL_PIPELINE_TIMES%" echo 0000000000000004,500,refused,0.0,1.0'
+        'if "%XCL_PIPELINE_MAX_KB%"=="0" >> "%XCL_PIPELINE_TIMES%" echo 0000000000000005,9437184,made,0.0,200.0'
         '>> "%~dp0env-%XCL_PIPELINE_THREADS%.txt" echo %~n0 %XCL_PSO_DISK_CACHE% %XCL_PIPELINE_CACHE_OFF% %*'
         'exit /b 0'
     ) -join "`r`n") + "`r`n")
@@ -37,9 +41,9 @@ try {
         $seen = (Get-Content (Join-Path $fixture "env-$n.txt") -Raw).Trim()
         if ($seen -notmatch "^xcl-cold-$n-[0-9a-f]{8} 0 1 shaders D:\\pack --precompile --only cs --limit 10 --pipelines$") { throw "threads ${n}: exe name, environment or arguments wrong: $seen" }
         $names += ($seen -split ' ')[0]
-        # made: 0.1 + 0.3 + 5.0 s; p50 of three is the second, p95 and max the third
-        if ($table -notmatch "\| $n \| [\d.]+ \| [\d.]+ \| \d+ \| 3 \| 1 \| 5\.4 \| 0\.3 \| 5 \| 5 \|") { throw "threads ${n}: summary row wrong:`n$table" }
-        foreach ($row in @("\| $n \| < 64 KiB \| 1 \| 0\.1 \|", "\| $n \| 64-256 KiB \| 1 \| 0\.3 \|", "\| $n \| 1-4 MiB \| 1 \| 5 \|")) {
+        # Four made rows: 0.1, 0.2, 0.3 and 5.0 s in duration order.
+        if ($table -notmatch "\| $n \| [\d.]+ \| [\d.]+ \| \d+ \| 4 \| 1 \| 5\.6 \| 0\.2 \| 5 \| 5 \|") { throw "threads ${n}: summary row wrong:`n$table" }
+        foreach ($row in @("\| $n \| < 64 KiB \| 1 \| 0\.1 \|", "\| $n \| 64-256 KiB \| 1 \| 0\.3 \|", "\| $n \| 1-4 MiB \| 1 \| 5 \|", "\| $n \| >= 4 MiB \| 1 \| 0\.2 \|")) {
             if ($table -notmatch $row) { throw "threads ${n}: bucket row missing ($row):`n$table" }
         }
     }
@@ -60,14 +64,18 @@ try {
     if (-not $refused) { throw '-Threads 4,x was not refused' }
 
     # -ClearNvCache replaces the implicit-cache switch
+    $env:XCL_PIPELINE_CACHE_OFF = '1'
     & $bench -Shaders 'D:\pack' -Threads 6 -Xcl $xcl -Out (Join-Path $fixture 'out2') -ClearNvCache *> $null
     $seen = (Get-Content (Join-Path $fixture 'env-6.txt') -Raw).Trim()
-    if ($seen -notmatch '^xcl-cold-6-[0-9a-f]{8} 0 +shaders D:\\pack --precompile --only cs --pipelines$') { throw "-ClearNvCache: caches switch still set: $seen" }
+    if ($seen -notmatch '^xcl-cold-6-[0-9a-f]{8} 0 0 shaders D:\\pack --precompile --only cs --pipelines$') { throw "-ClearNvCache: caches switch still set: $seen" }
+    if ((Import-Csv -LiteralPath (Join-Path $fixture 'out2\summary.csv')).made -ne '4') { throw '-ClearNvCache: large fixture row missing' }
+    if ($env:XCL_PIPELINE_MAX_KB -ne '8192' -or $env:XCL_PIPELINE_CACHE_OFF -ne '1') { throw 'benchmark changed caller environment' }
     if (Test-Path -LiteralPath $sentinel) { throw '-ClearNvCache: temporary cache was not cleared' }
     'cold-pso-bench.ps1: ok'
 } finally {
     $env:LOCALAPPDATA = $savedAppData
     $env:XCL_PIPELINE_TIMES = $savedTimes
     $env:XCL_PIPELINE_CACHE_OFF = $savedCacheOff
+    $env:XCL_PIPELINE_MAX_KB = $savedMaxKb
     Remove-Item -Recurse -Force $fixture -ErrorAction SilentlyContinue
 }
