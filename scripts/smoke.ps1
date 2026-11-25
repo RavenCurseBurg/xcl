@@ -56,7 +56,13 @@ $env:XCL_RUN_SECONDS = "$Seconds"
 $env:XCL_ACTIVITY = '1'
 $debugWas = Get-Item Env:XCL_D3D12_DEBUG -ErrorAction SilentlyContinue
 if ($DebugLayer) { $env:XCL_D3D12_DEBUG = '1' }
-$null = $p.Start()
+try {
+    $null = $p.Start()
+} finally {
+    if ($DebugLayer) {
+        if ($debugWas) { Set-Item Env:XCL_D3D12_DEBUG $debugWas.Value } else { Remove-Item Env:XCL_D3D12_DEBUG -ErrorAction SilentlyContinue }
+    }
+}
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
 if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
@@ -67,9 +73,6 @@ $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
-if ($DebugLayer) {
-    if ($debugWas) { Set-Item Env:XCL_D3D12_DEBUG $debugWas.Value } else { Remove-Item Env:XCL_D3D12_DEBUG -ErrorAction SilentlyContinue }
-}
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
