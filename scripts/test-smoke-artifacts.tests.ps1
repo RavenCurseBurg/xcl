@@ -90,6 +90,13 @@ exit /b 0
     try { $null = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 1 -Build 'invalid' } catch { $threw = $true }
     if (-not $threw) { throw '-Build invalid was accepted' }
 
+    # Run 4: positional invocation preserves 5th slot for OutDir
+    $null = & $runner $gameDir 1 $mockXcl 'PositionalRun' $outDir2
+    if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on positional run" }
+    if (-not (Test-Path (Join-Path $outDir2 'manifest.json'))) { throw 'positional run did not write manifest.json in OutDir' }
+    $manifestPos = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($manifestPos.title -ne 'PositionalRun') { throw "unexpected positional title: $($manifestPos.title)" }
+
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
     if (Test-Path -LiteralPath $fixture) {
