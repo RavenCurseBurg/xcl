@@ -163,6 +163,9 @@ def main(argv=None):
     if not args or args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0 if (args and args[0] in ("-h", "--help")) else 2
+    if len(args) > 2:
+        print(f"error: unexpected argument: {args[2]!r}", file=sys.stderr)
+        return 2
 
     src = args[0]
     if not os.path.isfile(src):

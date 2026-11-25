@@ -76,6 +76,21 @@ class GenBcpackVictoryTablesCliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("error: file not found", res.stderr)
 
+    def test_extra_argument_leaves_output_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "tables.bin"
+            source.write_bytes(make_synthetic_tables_bin())
+            output = Path(tmp) / "tables.rs"
+            output.write_bytes(b"previous output")
+            res = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), str(source), str(output), "extra"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("unexpected argument", res.stderr)
+            self.assertEqual(output.read_bytes(), b"previous output")
+
     def test_invalid_size_file_exits_code_1_with_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad_file = Path(tmp) / "truncated.bin"
