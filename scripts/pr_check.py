@@ -166,13 +166,13 @@ def check(body, head, files, is_main_ancestor, *, test_only=False, notes=None):
                     pcs = [c for c in (number(b.get("peak commit")) for b in clean if same(b)) if c]
                     mcs = [c for c in (number(b.get("peak commit")) for b in main if same(b)) if c]
                     if pcs and mcs:
-                        pc, mc = round(statistics.median(pcs)), round(statistics.median(mcs))
+                        pc, mc = statistics.median(pcs), statistics.median(mcs)
                         runs = min(len(pcs), len(mcs))
                         of = f", medians of {len(pcs)} and {len(mcs)} runs" if max(len(pcs), len(mcs)) > 1 else ""
                         if pc > (COMMIT_GROWTH if runs >= COMMIT_RUNS else COMMIT_NOISE) * mc:
                             problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB{of})")
                         elif pc > COMMIT_GROWTH * mc and notes is not None:
-                            notes.append(f"the PR's run commits {pc * 100 // mc} % of main's peak commit ({pc} MB against "
+                            notes.append(f"the PR's run commits {int(pc * 100 // mc)} % of main's peak commit ({pc} MB against "
                                          f"{mc} MB{of}): over 125 %, but with fewer than {COMMIT_RUNS} runs on each side "
                                          f"that is inside the run-to-run spread (#2225), so it does not fail; paste "
                                          f"{COMMIT_RUNS} `xcl-smoke` blocks of each to have the medians compared")

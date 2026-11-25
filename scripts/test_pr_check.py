@@ -139,6 +139,17 @@ class PeakCommitTests(unittest.TestCase):
                           "(24000 MB against 18160 MB, medians of 3 and 3 runs)"], problems)
         self.assertEqual([], notes)
 
+    def test_even_run_counts_keep_half_mb_at_the_limits(self):
+        for main_peaks, pr_peaks, pr_median in [
+            ([10000] * 4, [12500, 12500, 12501, 12501], '12500.5'),
+            ([10000] * 2, [20000, 20001], '20000.5'),
+        ]:
+            with self.subTest(pr_median=pr_median):
+                problems, notes = self.problems_and_notes(main_peaks, pr_peaks)
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn(f'{pr_median} MB', problems[0])
+                self.assertEqual([], notes)
+
     def test_a_low_draw_among_three_runs_does_not_decide(self):
         # Creaa's runs of one build of main (#2225): one low run among high ones
         self.assertEqual(([], []), self.problems_and_notes([19705, 11374, 17690], [17408, 19806, 17499]))
