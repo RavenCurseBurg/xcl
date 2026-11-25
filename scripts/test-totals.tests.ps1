@@ -32,7 +32,7 @@ exit /b $testExit
     if ($skipSummary -and !$output.Contains($skipSummary)) { throw "${name}: lost the skip summary" }
     if ($buildExit) {
         if ($output.Contains('forwarded:')) { throw "${name}: ran tests after a failed build" }
-    } elseif (!$output.Contains('forwarded: test --workspace -- --test-threads=4 --skip omitted')) {
+    } elseif ($output -cnotmatch '(?m)^forwarded: test (?:--locked )?--workspace -- --test-threads=4 --skip omitted\r?$') {
         throw "${name}: changed the forwarded test arguments"
     }
     Write-Host "PASS $name"
