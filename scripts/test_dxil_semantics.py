@@ -78,6 +78,19 @@ class SemanticFixtureTests(unittest.TestCase):
         entry = INSPECTOR._entry_metadata(self.dump, nodes)
         self.assertEqual(entry["thread_group_size"], [8, 4, 2])
 
+    def test_resource_bindings_include_all_four_register_classes(self) -> None:
+        source = FIXTURE.with_name("resource_bindings.hlsl")
+        container = Path(self.temp.name) / "resource_bindings.dxil"
+        subprocess.run([str(self.dxc), "-E", "main", "-T", "cs_6_6", "-O3", "-Fo", str(container), str(source)],
+                       check=True, capture_output=True, text=True)
+        bindings = INSPECTOR.inspect_dxil(container, self.dxc)["resource_bindings"]
+        self.assertEqual([(r["kind"], r["hlsl_binding"], r["count"]) for r in bindings], [
+            ("CBUFFER", "cb2,space1", 1),
+            ("SAMPLER", "s1,space4", 1),
+            ("SRV", "t3,space2", 2),
+            ("UAV", "u5,space3", 1),
+        ])
+
     def test_features_operations_and_resource_semantics(self) -> None:
         self.assertEqual(self.report["sfi0_feature_flags"], "0x0000000000004000")
         self.assertIn("Wave level operations", self.report["required_features"])

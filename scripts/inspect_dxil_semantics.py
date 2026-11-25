@@ -123,7 +123,7 @@ def _node_ints(node: str, width: int | None = None) -> list[int]:
 
 def _resource_bindings(text: str) -> list[dict[str, object]]:
     row = re.compile(
-        r"^;\s*(\S+)\s+(CBUFFER|TBUFFER|SRV|UAV|SAMPLER)\s+(\S+)\s+(\S+)\s+(\S+)\s+([btsu]\d+(?:,space\d+)?)\s+(\S+)\s*$",
+        r"^;\s*(\S+)\s+(CBUFFER|TBUFFER|SRV|TEXTURE|UAV|SAMPLER)\s+(\S+)\s+(\S+)\s+(\S+)\s+((?:cb|[btsu])\d+(?:,space\d+)?)\s+(\S+)\s*$",
         re.I,
     )
     resources = []
@@ -133,7 +133,7 @@ def _resource_bindings(text: str) -> list[dict[str, object]]:
             continue
         _, kind, format_name, dimension, _, binding, count = match.groups()
         resources.append({
-            "kind": kind.upper(),
+            "kind": "SRV" if kind.lower() == "texture" else kind.upper(),
             "format": format_name,
             "dimension": dimension,
             "hlsl_binding": binding,
