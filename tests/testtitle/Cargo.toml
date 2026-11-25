@@ -1,10 +1,9 @@
 [package]
 name = "xcl-testtitle"
 description = "Fake 'console title' used to test XCL. Imports console DLLs (kernelx.dll, xgameruntime.dll, d3d12_xs.dll) and cannot run on plain Windows."
-rust-version.workspace = true
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-rust-version.workspace = true
 publish = false
 
 [[bin]]
