@@ -14,11 +14,12 @@ try {
 using System;
 using System.IO;
 public class LauncherProbe {
-    public static void Main(string[] args) {
+    public static int Main(string[] args) {
         File.WriteAllLines("probe.txt", new[] {args[0], args[1],
             Environment.GetEnvironmentVariable("XCL_THREAD_DUMP_AT"),
             Environment.GetEnvironmentVariable("XCL_TRACE_FAULTS"),
             Environment.GetEnvironmentVariable("XCL_HOST")});
+        return File.Exists("fail-next-launch") ? 37 : 0;
     }
 }
 '@
@@ -38,6 +39,16 @@ public class LauncherProbe {
     & $launcher -Launch -Preset 'Short trace'
     $probe = [IO.File]::ReadAllLines((Join-Path $root 'probe.txt'))
     if ($LASTEXITCODE -ne 0 -or $probe[2] -cne '3,6' -or $probe[3] -ne '') { throw 'Custom preset mismatch' }
+    $failureFlag = Join-Path $root 'fail-next-launch'
+    [IO.File]::WriteAllText($failureFlag, '')
+    & $launcher -Launch -Preset 'Short trace' -Options @{ XCL_THREAD_DUMP_AT = ''; XCL_TRACE_FAULTS = '1' }
+    if ($LASTEXITCODE -ne 37) { throw 'Direct launch lost the child exit code' }
+    $probe = [IO.File]::ReadAllLines((Join-Path $root 'probe.txt'))
+    if ($probe[2] -ne '' -or $probe[3] -cne '1') { throw 'The child did not receive the preset overrides' }
+    Remove-Item -LiteralPath $failureFlag
+    & $launcher -Launch -Preset 'Short trace'
+    $probe = [IO.File]::ReadAllLines((Join-Path $root 'probe.txt'))
+    if ($LASTEXITCODE -ne 0 -or $probe[2] -cne '3,6' -or $probe[3] -ne '') { throw 'Overrides changed the named preset' }
     'Launcher checks passed.'
 } finally {
     $env:LOCALAPPDATA = $oldLocal
