@@ -10,6 +10,13 @@ $game = Join-Path $fixture 'SomeTitle'
 $null = New-Item -ItemType Directory -Path $game
 function Get-Block { ((& $smoke -Game $game -Seconds 1 -Xcl $xcl) -join "`n") -replace "`r", '' }
 function Assert-Line($block, $line) { if (!$block.Contains("$line`n")) { throw "Expected '$line' in the block:`n$block" } }
+# Keep controller order and the reported adapter independent of the host hardware.
+function Get-CimInstance([string]$ClassName) {
+    if ($ClassName -ne 'Win32_VideoController') { throw "Unexpected CIM class: $ClassName" }
+    foreach ($name in 'Microsoft Basic Display Adapter', 'Fixture integrated GPU', 'Synthetic Adapter 9000') {
+        [pscustomobject]@{ Name = $name }
+    }
+}
 try {
     "@echo off`r`necho Log:    $log" | Set-Content -LiteralPath $xcl -Encoding Ascii
     @(
@@ -17,8 +24,6 @@ try {
         'xcl: memory: 1234 MB committed by the process'
         'xcl: timed run over (118 frames shown, 120 PresentX calls)'
     ) | Set-Content -LiteralPath $log -Encoding utf8
-    $first = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name
-
     # a run on a machine's second adapter: the block names the one in the run's report
     '{"d3d12":{"adapter":"Synthetic Adapter 9000 (32187 MiB VRAM)"}}' | Set-Content -LiteralPath $report -Encoding utf8
     $block = Get-Block
@@ -28,11 +33,13 @@ try {
         Assert-Line $block $line
     }
 
-    # a report without an adapter (the null backend), and no report at all: the first video controller
+    # A missing, null or unreadable report falls back to the first non-Basic controller.
     '{"d3d12":{"adapter":null}}' | Set-Content -LiteralPath $report -Encoding utf8
-    Assert-Line (Get-Block) "gpu: $first"
+    Assert-Line (Get-Block) 'gpu: Fixture integrated GPU'
+    '{' | Set-Content -LiteralPath $report -Encoding utf8
+    Assert-Line (Get-Block) 'gpu: Fixture integrated GPU'
     Remove-Item -LiteralPath $report
-    Assert-Line (Get-Block) "gpu: $first"
+    Assert-Line (Get-Block) 'gpu: Fixture integrated GPU'
 
     # a crash and a device removal in the log are counted
     Add-Content -LiteralPath $log -Value 'xcl: D3D12.X: device removed (0x887a0006)', 'xcl: unhandled exception 0xc0000005' -Encoding utf8
