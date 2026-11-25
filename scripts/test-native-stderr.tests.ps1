@@ -5,12 +5,21 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-native-stderr-' + [guid]::
 $null = New-Item -ItemType Directory -Path $fixture
 $cargo = Join-Path $fixture 'cargo.cmd'
 $log = Join-Path $fixture 'runner.log'
+$checkout = Join-Path $fixture 'checkout [a]'
+$sibling = Join-Path $fixture 'checkout a'
+$scripts = Join-Path $checkout 'scripts'
+$siblingScripts = Join-Path $sibling 'scripts'
+$fixtureRunner = Join-Path $scripts 'test.ps1'
 $oldPath = $env:PATH
 Push-Location
 try {
+    $null = [IO.Directory]::CreateDirectory($scripts)
+    $null = [IO.Directory]::CreateDirectory($siblingScripts)
+    [IO.File]::Copy($runner, $fixtureRunner)
     @'
 @echo off
 if "%1"=="build" (
+    cd
     >&2 echo synthetic build progress
     exit /b 0
 )
@@ -26,7 +35,7 @@ exit /b 127
     Set-Location -LiteralPath $fixture
     $originalLocation = (Get-Location).Path
 
-    & $runner *> $log
+    & $fixtureRunner *> $log
 
     if ($LASTEXITCODE -ne 0) {
         throw "Runner exited $LASTEXITCODE on a successful build."
@@ -36,6 +45,9 @@ exit /b 127
         throw 'test.ps1 changed the caller working directory.'
     }
     $output = Get-Content -LiteralPath $log -Raw
+    if (($output -split '\r?\n') -notcontains $checkout) {
+        throw 'Cargo did not run in the literal checkout directory.'
+    }
     if (!$output.Contains('synthetic build progress') -or
         !$output.Contains('GPU tests skipped on this adapter: 1 (synthetic reason)')) {
         throw 'Expected native build output and the GPU skip summary in the redirected log.'
@@ -43,7 +55,7 @@ exit /b 127
 } finally {
     Pop-Location
     $env:PATH = $oldPath
-    foreach ($path in $cargo, $log, $fixture) {
+    foreach ($path in $cargo, $log, $fixtureRunner, $scripts, $checkout, $siblingScripts, $sibling, $fixture) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
 }
