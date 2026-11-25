@@ -125,7 +125,9 @@ pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
         130 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         132 => DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
         133 => return Some((DXGI_FORMAT_B5G6R5_UNORM, BGRA)),
-        135 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
+        // 1_5_5_5 (names list the fields from the top bit down): x in bits 0-4, w in bit 15.
+        // 5_5_5_1 (135) keeps its 1-bit field in bit 0, which no DXGI format has
+        134 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
         136 => return Some((DXGI_FORMAT_B4G4R4A4_UNORM, BGRA)),
         169 => DXGI_FORMAT_BC1_UNORM,
         170 => DXGI_FORMAT_BC1_UNORM_SRGB,
@@ -295,11 +297,14 @@ pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
         (false, 2) => 3, // max
         _ => 0,
     };
-    let filter = if (mag >= 2 || min >= 2) && aniso > 1 {
+    // XY filter: 0 point, 1 bilinear, 2 aniso point, 3 aniso bilinear. A driver writes aniso
+    // point for a nearest filter with anisotropy on (Mesa's radv_tex_filter); D3D12's
+    // anisotropic filter is linear, so only aniso bilinear becomes it, and aniso point is point
+    let filter = if (mag == 3 || min == 3) && aniso > 1 {
         0x55 | reduction << 7 // D3D12_ENCODE_ANISOTROPIC_FILTER
     } else {
         // D3D12_ENCODE_BASIC_FILTER(min, mag, mip, reduction): linear = 1
-        let lin = |x: u32| (x & 1 == 1 || x >= 2) as u32;
+        let lin = |x: u32| x & 1;
         (lin(min) << 4) | (lin(mag) << 2) | ((mip == 2) as u32) | reduction << 7
     };
     let s5_8 = |v: u32| ((v as i32) << 18 >> 18) as f32 / 256.0;
@@ -413,6 +418,10 @@ mod tests {
         assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
+        // 1_5_5_5 is B5G5R5A1 (and the format XCL writes into its views' T#s); 5_5_5_1 has none
+        assert_eq!(dxgi_format(134), Some((DXGI_FORMAT_B5G5R5A1_UNORM, [2, 1, 0, 3])));
+        assert!(dxgi_format(135).is_none());
+        assert_eq!(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM), Some(134));
     }
 
     #[test]
@@ -585,9 +594,19 @@ mod tests {
         assert_eq!((s.MipLODBias, s.MinLOD, s.MaxLOD, s.BorderColor), (-1.5, 0.0, 13.0, [1.0; 4]));
         assert_eq!(s.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS);
         assert_eq!(sampler_d3d12(&w, true).Filter, D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR);
+        // aniso bilinear (3) min / mag with a ratio above 1: anisotropic
         let mut a = w;
-        a[2] = 2 << 20 | 2 << 22 | 2 << 26;
+        a[2] = 3 << 20 | 3 << 22 | 2 << 26;
         assert_eq!(sampler_d3d12(&a, false).Filter, D3D12_FILTER_ANISOTROPIC);
+        // aniso point (2) min / mag is a nearest filter with anisotropy on: point, not
+        // anisotropic (linear) – with the ratio set or not, and with a linear mip filter
+        let mut p = a;
+        p[2] = 2 << 20 | 2 << 22;
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        p[0] &= !(7 << 9);
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        p[2] |= 2 << 26;
+        assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR);
     }
 
     #[test]
