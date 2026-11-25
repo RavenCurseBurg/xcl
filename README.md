@@ -187,7 +187,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 ## Building and usage
 
-Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
+Windows 10/11 x64, Rust 1.100.0 (`x86_64-pc-windows-msvc`, `rust-toolchain.toml`), the Windows SDK (DXC: `dxcompiler.dll`
 and `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
 `%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
@@ -277,7 +277,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ## Tests
 
 ```powershell
-.\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\test.ps1                         # cargo build --locked --workspace + cargo test --locked --workspace
 ```
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests

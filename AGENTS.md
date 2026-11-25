@@ -17,11 +17,11 @@ the `xcl` CLI), `tests/testtitle` + `tests/testgamedll` (our own console title f
 
 ## Build and test
 
-Windows 10/11 x64 only, `stable-x86_64-pc-windows-msvc`, Windows SDK (DXC), a D3D12 GPU with SM 6.6.
+Windows 10/11 x64 only, Rust 1.100.0 (`x86_64-pc-windows-msvc`, `rust-toolchain.toml`), Windows SDK (DXC), a D3D12 GPU with SM 6.6.
 
 ```powershell
 .\scripts\test.ps1                                         # build + all tests
-cargo build --workspace && cargo test --workspace -- --test-threads=4   # same, from bash / in the background
+cargo build --locked --workspace && cargo test --locked --workspace -- --test-threads=4   # same, from bash / in the background
 cargo test -p xcl --lib <filter>                           # one area while iterating
 ```
 
