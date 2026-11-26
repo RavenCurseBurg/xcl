@@ -51,16 +51,42 @@
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
+pub mod cfg;
 pub mod dxc;
+pub mod dxil;
+pub mod lane_masks;
+pub mod lower;
+pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
+pub mod ssa;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod heap_window_tests;
+
+/// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
+/// window k is raw UAV `MEM_HEAP_BASE + k`. Not 0: a T# whose word 0 is 0 (an empty console
+/// slot, all zeros) makes image shaders take `ResourceDescriptorHeap[0]` (SRV) and `[1]` (UAV);
+/// with the windows there that is a 4 GiB raw buffer UAV read as a texture, which hangs NVIDIA
+/// GPUs (DXGI_ERROR_DEVICE_HUNG). Descriptors below hold null views
+/// (`console_heap::null_views`).
+pub const MEM_HEAP_BASE: u32 = 4;
+
+/// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
+/// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
+pub const HEAP_WINDOWS: u32 = 0x100;
+
+pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
+    windows <= crate::gpu::uma::MAX_WINDOWS
+        || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
+}
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -492,6 +518,11 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// with `mem_windows` > 1: reach window k through descriptor `MEM_HEAP_BASE + k` of the
+    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`) – one access per
+    /// site instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
+    /// access once per window (HANDOFF: twice the DXC + driver time with 4 windows)
+    pub heap_windows: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
@@ -499,7 +530,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
     }
 }
 
@@ -534,6 +565,9 @@ struct Ctx<'a> {
     loops: &'a [(u64, u64)],
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
+    /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
+    /// phase's entry, so no structured stretch may run across it
+    phase_split: bool,
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
 }
@@ -580,8 +614,29 @@ fn why(_at: u64, msg: &str) {
     }
 }
 
-/// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
-type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
+/// (lo, hi, exit, nest, the loops around it, targets entering the range)
+type MemoKey = (u64, u64, Option<u64>, usize, Conts, Vec<u64>);
+
+/// The loops around a level, by their heads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct Conts {
+    /// the innermost one: a jump back to it is `continue`
+    inner: Option<u64>,
+    /// the ones around that: a jump back to one sets its flag (`skip_flag` of the head), which
+    /// leaves the loops inside it and is `continue` there
+    outer: Vec<u64>,
+}
+
+impl Conts {
+    /// Inside a loop with head `head` (None: one that is not continued by a jump to its head).
+    fn enter(&self, head: Option<u64>) -> Conts {
+        Conts { inner: head, outer: self.outer.iter().copied().chain(self.inner).collect() }
+    }
+    /// A backward target that an enclosing loop's level takes care of.
+    fn heads(&self, t: u64) -> bool {
+        self.inner == Some(t) || self.outer.contains(&t)
+    }
+}
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
 /// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
@@ -589,6 +644,12 @@ type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
+/// Each guard of the structured form lists every pending skip flag, so it grows with the
+/// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),
+/// the next largest 61 (#1307).
+const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
@@ -624,6 +685,23 @@ pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
     loops
 }
 
+/// `loop_ranges` for structured code: of two partly overlapping ranges the later one stays, as a
+/// loop inside their union (the back edge of the earlier one then leaves it: `Conts::outer`).
+fn nested_loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
+    let mut loops: Vec<(u64, u64)> =
+        insts.iter().filter_map(|d| rdna2::branch_target(d).filter(|&t| t <= d.pc).map(|t| (t, d.pc + d.len as u64))).collect();
+    loop {
+        let overlap = loops.iter().enumerate().find_map(|(i, a)| loops.iter().find(|b| a.0 < b.0 && b.0 < a.1 && a.1 < b.1).map(|b| (i, b.1)));
+        match overlap {
+            Some((i, end)) => loops[i].1 = end,
+            None => break,
+        }
+    }
+    loops.sort();
+    loops.dedup();
+    loops
+}
+
 /// Target of an s_endpgm before the end of the program: "skip to the end".
 const END: u64 = u64::MAX;
 /// "Target" of a jump back to the head of the innermost loop: `continue`.
@@ -647,7 +725,8 @@ fn skip_flag(t: u64) -> String {
 /// One item of a structured level.
 #[derive(Clone, Copy, Debug)]
 enum Item {
-    /// loop [a, b) whose last block (`latch`) branches back to a; `entry`: entered by a jump
+    /// loop [a, b) whose last block (`latch`) branches back to a – `latch` = b: it does not, the
+    /// loop is only continued from inside and its end leaves it; `entry`: entered by a jump
     /// to this point inside (the rotated form `for (;;) { [entry, latch) latch [a, entry) }`)
     Loop { a: u64, b: u64, latch: u64, entry: Option<u64> },
     /// `if (!cond) { [end, t) } [else { [t, u) }]` after the block [start, end)
@@ -672,17 +751,21 @@ impl Item {
 /// at this level – no if may swallow one, a conditional jump past it becomes a skip flag).
 /// Err: a shape the structured form cannot express (backward jumps other than loop latches,
 /// s_setpc …).
-fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: Option<u64>, pending: &BTreeSet<u64>) -> Result<(Item, usize), String> {
+fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: &Conts, pending: &BTreeSet<u64>) -> Result<(Item, usize), String> {
     let start = c.leaders[i];
     let end = block_end(c, i);
     let next = |x: u64| c.leaders.partition_point(|&l| l < x);
     let inside = |a: u64, b: u64| pending.iter().any(|&p| p > a && p < b);
-    // (a range that is exactly a loop – e.g. the body of an if – is that loop)
-    if let Some(&(a, b)) = c.loops.iter().find(|&&(a, b)| a == start && b <= hi) {
+    // a jump from here to `t` enters a loop that starts in between: no if (its range would cut the
+    // loop) but a skip flag, which the loop's first iteration starts under (`enter_loop`)
+    let into_loop = |t: u64| c.loops.iter().any(|&(a, b)| a >= end && a < t && t < b);
+    // (a range that is exactly a loop – e.g. the body of an if – is that loop; of several with
+    // this head the longest, the others' back edges are `continue` in it)
+    if let Some(&(a, b)) = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && cont.inner != Some(a)).max_by_key(|l| l.1) {
         let last = next(b) - 1;
-        let latch = c.leaders[last];
+        let mut latch = c.leaders[last];
         if !matches!(term(c, latch, b), Term::Cond(t) | Term::Jump(t) if t == a) {
-            return Err(format!("loop {a:#x}..{b:#x}: end {:?}", term(c, latch, b)));
+            latch = b;
         }
         return Ok((Item::Loop { a, b, latch, entry: None }, next(b)));
     }
@@ -690,15 +773,17 @@ fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, 
     let item = match term(c, start, end) {
         Term::Next => Item::Block { start, end, raise: None },
         // back to the head of the innermost loop: continue
-        Term::Cond(t) | Term::Jump(t) if Some(t) == cont => Item::Block { start, end, raise: Some(CONT) },
+        Term::Cond(t) | Term::Jump(t) if Some(t) == cont.inner => Item::Block { start, end, raise: Some(CONT) },
+        // back to the head of a loop around that: its flag
+        Term::Cond(t) | Term::Jump(t) if cont.outer.contains(&t) => Item::Block { start, end, raise: Some(t) },
         // a jump into the loop that starts right after: the rotated form (the jump itself is
         // the loop entry, emitted as nothing)
         Term::Jump(u) if rotated_loop(c, start, end, u, lo, hi).is_some() => Item::Block { start, end, raise: None },
-        Term::Cond(t) if nest < MAX_NEST && t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) && !inside(start, t) => {
+        Term::Cond(t) if nest < MAX_NEST && t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) && !inside(start, t) && !into_loop(t) => {
             // if / else only when both branches are structured on their own, the if branch
             // does not jump into the else branch and no earlier jump lands in it; otherwise a
             // plain if (the else branch then runs under the skip flag of the jump over it)
-            let u = else_end(c, end, t, hi).filter(|&u| !inside(start, u) && else_ok(c, end, t, u, nest, cont));
+            let u = else_end(c, end, t, hi).filter(|&u| !inside(start, u) && !into_loop(u) && else_ok(c, end, t, u, nest, cont));
             return Ok((Item::If { start, end, t, u }, next(u.unwrap_or(t))));
         }
         // past the level, or over a target an earlier jump waits for: a skip flag
@@ -742,7 +827,7 @@ fn rotated_loop(c: &Ctx, start: u64, end: u64, u: u64, lo: u64, hi: u64) -> Opti
 
 /// `if (!c) { [end, t) } else { [t, u) }` holds: both branches structured, the if branch does
 /// not jump into the else branch.
-fn else_ok(c: &Ctx, end: u64, t: u64, u: u64, nest: usize, cont: Option<u64>) -> bool {
+fn else_ok(c: &Ctx, end: u64, t: u64, u: u64, nest: usize, cont: &Conts) -> bool {
     let none = BTreeSet::new();
     match structurable_to(c, end, t, Some(u), nest + 1, cont, &none) {
         Some(r) if !r.iter().any(|&x| x >= t && x < u) => structurable_to(c, t, u, None, nest + 1, cont, &none).is_some(),
@@ -756,7 +841,7 @@ fn else_ok(c: &Ctx, end: u64, t: u64, u: u64, nest: usize, cont: Option<u64>) ->
 /// forward jumps out of nested code (loop breaks, jumps past a join, s_endpgm before the end)
 /// whose target starts an item of an enclosing level. Some(targets that leave the range).
 fn structurable(c: &Ctx, lo: u64, hi: u64) -> Option<BTreeSet<u64>> {
-    structurable_to(c, lo, hi, None, 0, None, &BTreeSet::new())
+    structurable_to(c, lo, hi, None, 0, &Conts::default(), &BTreeSet::new())
 }
 
 /// The else branch of `if (cond) { [then_lo, t) } else { [t, u) }`: the last block of the
@@ -773,11 +858,11 @@ fn else_end(c: &Ctx, then_lo: u64, t: u64, hi: u64) -> Option<u64> {
     }
 }
 
-/// `cont`: head of the innermost loop (a jump back to it is `continue`); `incoming`: forward
+/// `cont`: the loops around the range; `incoming`: forward
 /// targets of jumps from before the range that land inside it (a loop entered in its middle:
 /// the code before them runs under their skip flags, i.e. from the second iteration on).
-fn structurable_to(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: Option<u64>, incoming: &BTreeSet<u64>) -> Option<BTreeSet<u64>> {
-    let key = (lo, hi, exit, nest.min(MAX_NEST), cont, incoming.iter().copied().collect::<Vec<_>>());
+fn structurable_to(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: &Conts, incoming: &BTreeSet<u64>) -> Option<BTreeSet<u64>> {
+    let key = (lo, hi, exit, nest.min(MAX_NEST), cont.clone(), incoming.iter().copied().collect::<Vec<_>>());
     if let Some(r) = c.memo.borrow().get(&key) {
         return r.clone();
     }
@@ -795,7 +880,7 @@ fn enter_loop(pending: &mut BTreeSet<u64>, a: u64, b: u64) -> BTreeSet<u64> {
     inner
 }
 
-fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: Option<u64>, incoming: &BTreeSet<u64>) -> Option<BTreeSet<u64>> {
+fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usize, cont: &Conts, incoming: &BTreeSet<u64>) -> Option<BTreeSet<u64>> {
     let mut pending: BTreeSet<u64> = incoming.clone();
     let mut i = c.leaders.partition_point(|&l| l < lo);
     let mut queued: Option<Item> = None;
@@ -830,17 +915,20 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
         let none = BTreeSet::new();
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, latch, entry: None, .. } => {
-                let mut r = structurable_to(c, a, latch, None, nest + 1, Some(a), &inner)?;
-                r.remove(&latch);
+                let mut r = structurable_to(c, a, latch, None, nest + 1, &cont.enter(Some(a)), &inner)?;
+                if latch != e {
+                    r.remove(&latch);
+                }
+                r.remove(&a);
                 r
             }
             Item::Loop { a, latch, entry: Some(u), .. } => {
                 // the head [a, u) runs at the end of an iteration and may only fall into u
-                if structurable_to(c, a, u, None, nest + 1, None, &none)?.iter().any(|&t| t != u) {
+                if structurable_to(c, a, u, None, nest + 1, &cont.enter(None), &none)?.iter().any(|&t| t != u) {
                     why(a, &format!("rotated loop {a:#x}: the head exits elsewhere than {u:#x}"));
                     return None;
                 }
-                let mut r = structurable_to(c, u, latch, None, nest + 1, None, &none)?;
+                let mut r = structurable_to(c, u, latch, None, nest + 1, &cont.enter(None), &none)?;
                 r.remove(&latch);
                 r
             }
@@ -858,7 +946,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
             Item::Block { raise: Some(CONT), .. } => BTreeSet::new(),
             Item::Block { raise, .. } => raise.into_iter().collect(),
         };
-        if let Some(t) = raised.iter().find(|&&t| t < e) {
+        if let Some(t) = raised.iter().find(|&&t| t < e && !cont.heads(t)) {
             why(s, &format!("backward/inward branch to {t:#x} from {s:#x}..{e:#x}"));
             return None;
         }
@@ -867,18 +955,84 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
+/// The whole-wave reductions of a wave32 program (`wave32_reductions`).
+#[derive(Default)]
+pub struct Reductions {
+    /// pc of a `v_cndmask` that starts one → the VGPR it writes
+    pub seeds: std::collections::BTreeMap<u64, u64>,
+    /// pc of the `v_readlane` that ends one → (its seed's pc, the operation: `xcl_red_<op>`)
+    pub reads: std::collections::BTreeMap<u64, (u64, &'static str)>,
+}
+
+/// The reductions the console's compiler makes over the lanes of a wave32 wave:
+/// `s_or_saveexec_b32 s, -1` (every lane runs, launched or not), `v_cndmask v, identity, value,
+/// mask`, three DPP8 steps (within 2, 4 and 8 lanes), a DPP row mirror, `v_permlanex16 w, v`, one more
+/// step and `v_readlane s, v, 0` – nothing else in between, all in one basic block.
+fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> Reductions {
+    let op_of = |d: &Decoded| match d.inst.name {
+        "V_OR_B32" => Some(("or", 128)),
+        "V_MAX_U32" => Some(("max", 128)),
+        "V_AND_B32" => Some(("and", 193)),
+        "V_MIN_U32" => Some(("min", 193)),
+        _ => None,
+    };
+    let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
+    let ext = |d: &Decoded, n: &str| emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, n));
+    // (the steps' waits and nops are not part of it)
+    let idle = |d: &Decoded| matches!(d.inst.name, "S_NOP" | "S_WAITCNT" | "V_NOP" | "S_WAITCNT_DEPCTR" | "S_INST_PREFETCH");
+    // step k takes its value from the other half of the 2^(k+1) lanes a lane is in (all lanes of a
+    // half hold the same by then, so any of them will do)
+    let other_half = |k: usize, n: u64, sel: Option<u64>| sel.is_some_and(|s| s >> (k + 1) == n >> (k + 1) && (s ^ n) >> k & 1 == 1);
+    let mut out = Reductions::default();
+    for (i, seed) in insts.iter().enumerate() {
+        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain {
+            continue;
+        }
+        // the every-lane section it is in, with no other EXEC write before the end
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let open = i - 1 - open;
+        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
+        let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
+        let Some((op, identity)) = op_of(a) else { continue };
+        let (_, w) = rdna2::vgpr_uses(seed);
+        let [v] = w[..] else { continue };
+        if f(seed, "SRC0") != Some(identity) {
+            continue;
+        }
+        let same = |d: &Decoded, variant: rdna2::Variant| {
+            let (r, w) = rdna2::vgpr_uses(d);
+            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+        };
+        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let crossed = {
+            let (r, w) = rdna2::vgpr_uses(cross);
+            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
+        };
+        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+            continue;
+        }
+        let (r, _) = rdna2::vgpr_uses(read);
+        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+            continue;
+        }
+        // one basic block, and EXEC kept all ones from the section's start
+        let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
+        let inside = &insts[open + 1..=end];
+        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
+        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
+        if !straight || exec {
+            continue;
+        }
+        out.seeds.insert(seed.pc, v);
+        out.reads.insert(read.pc, (seed.pc, op));
+    }
+    out
+}
+
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
-    let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-    for (k, d) in block.iter().enumerate() {
-        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
-        if !matches!(flow, emit::Flow::Next) {
-            break;
-        }
-    }
+    let flow = em.emit_insts(insts_in(c, start, end), end);
     body.push_str(&em.take());
     *blocks += 1;
     flow
@@ -895,7 +1049,7 @@ fn emit_structured(
     hi: u64,
     exit: Option<u64>,
     nest: usize,
-    cont: Option<u64>,
+    cont: &Conts,
     incoming: &BTreeSet<u64>,
     depth: usize,
     blocks: &mut usize,
@@ -943,17 +1097,24 @@ fn emit_structured(
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
                 body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
-                let (lcont, lin) = if entry.is_none() { (Some(a), &inner) } else { (None, &none) };
-                let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, lcont, lin, d + 1, blocks, flags);
+                let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
+                let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
-                    if t == latch {
+                    if t == latch && latch != b {
                         body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                    } else if t == a {
+                        // `continue` from a loop inside this one
+                        body.push_str(&format!("{ipad}    if ({0}) {{ {0} = false; continue; }}\n", skip_flag(t)));
                     } else {
                         body.push_str(&format!("{ipad}    if ({}) break;\n", skip_flag(t)));
                     }
                 }
-                r.remove(&latch);
-                match emit_block(c, em, body, latch, b, d + 1, blocks) {
+                if latch != b {
+                    r.remove(&latch);
+                }
+                r.remove(&a);
+                let latched = if latch == b { emit::Flow::Next } else { emit_block(c, em, body, latch, b, d + 1, blocks) };
+                match latched {
                     emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}    if (!({cond})) break;\n")),
                     // unconditional back edge: the loop is left through the skip flags' breaks
                     emit::Flow::Jump(_) | emit::Flow::JumpExpr(_) => {}
@@ -961,7 +1122,7 @@ fn emit_structured(
                 }
                 if let Some(u) = entry {
                     // rotated: the head after the latch, falling into the next iteration
-                    for t in emit_structured(c, em, body, a, u, None, nest + 1, None, &none, d + 1, blocks, flags) {
+                    for t in emit_structured(c, em, body, a, u, None, nest + 1, &cont.enter(None), &none, d + 1, blocks, flags) {
                         body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
                     }
                 }
@@ -1004,6 +1165,12 @@ fn emit_structured(
                 }
             }
         };
+        // a flag this item may set that the open guard has tested already: what follows tests it again
+        if guard.is_some() && raised.iter().any(|t| pending.contains(t)) {
+            body.push_str(&format!("{pad}}}
+"));
+            guard = None;
+        }
         pending.extend(raised);
     }
     if guard.is_some() {
@@ -1022,6 +1189,9 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     let mut j = i;
     while j < c.leaders.len() && c.leaders[j] < hi {
         let (s, e) = (c.leaders[j], block_end(c, j));
+        if c.phase_split && insts_in(c, s, e).last().is_some_and(|d| d.inst.name == "S_SETPC_B64" && d.far_target.is_none()) {
+            break;
+        }
         match term(c, s, e) {
             Term::End | Term::Other => break,
             Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
@@ -1036,7 +1206,7 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     }
     // entered only at start: no branch from outside lands strictly inside
     let entered_inside = |x: u64| c.edges.iter().any(|&(src, dst)| dst > start && dst < x && (src < start || src >= x));
-    ends.iter().rev().take(64).copied().find(|&x| !entered_inside(x) && structurable_to(c, start, x, None, 0, None, &BTreeSet::new()).is_some_and(|r| r.iter().all(|&t| t == x)))
+    ends.iter().rev().take(64).copied().find(|&x| !entered_inside(x) && structurable_to(c, start, x, None, 0, &Conts::default(), &BTreeSet::new()).is_some_and(|r| r.iter().all(|&t| t == x)))
 }
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
@@ -1056,7 +1226,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         // a single-entry, single-exit stretch: structured code under one guard
         if let Some(x) = structured_span(c, i, hi) {
             body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
-            for t in emit_structured(c, em, body, start, x, None, 0, None, &BTreeSet::new(), depth + 1, blocks, flags) {
+            for t in emit_structured(c, em, body, start, x, None, 0, &Conts::default(), &BTreeSet::new(), depth + 1, blocks, flags) {
                 body.push_str(&format!("{pad}    {} = false;\n", skip_flag(t)));
             }
             let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
@@ -1067,15 +1237,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
-        let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-        for (k, d) in block.iter().enumerate() {
-            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
-            if !matches!(flow, emit::Flow::Next) {
-                break;
-            }
-        }
+        let flow = em.emit_insts(insts_in(c, start, end), end);
         body.push_str(&em.take());
         let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
         let tail = match flow {
@@ -1213,6 +1375,14 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: 
     translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
+/// Wave size of an FSSM's program: wave32 when its header says so (`Fssm::wave32`), else by
+/// the code. A wave32 program that never writes EXEC has nothing in its code to tell, and
+/// `detect_wave64` takes it for wave64: its cross-lane reads (`v_readfirstlane`, `v_readlane`,
+/// permutes) then span 64 threads instead of 32.
+pub fn fssm_wave64(f: &super::xbox::Fssm, code: &[u8]) -> bool {
+    !f.wave32() && detect_wave64(code)
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;
@@ -1254,8 +1424,8 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk with constants earlier in its block, those words.
-fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+/// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
     for d in insts {
@@ -1273,6 +1443,8 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
         let set: Vec<(u64, u32)> = match d.inst.name {
             "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
             "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+            // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
+            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
             // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
             "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
                 (Some(r), Some(c @ 128..=208)) => {
@@ -1295,7 +1467,46 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
+/// Does the program require `globallycoherent` flat memory windows (`mem`, `mem1`…)?
+///
+/// Compute work that coordinates across workgroups (e.g. bottom-up BVH builds: atomics,
+/// then reading what other groups wrote) relies on `GLC`/`DLC`/`SLC`, memory atomics, or
+/// cache invalidation on the console. Programs without any of those only access read-only
+/// or disjointly written memory within the dispatch, so keeping their flat memory windows
+/// un-qualified lets the GPU cache them in L1.
+pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV") {
+            return true;
+        }
+        if name.starts_with("BUFFER_ATOMIC_")
+            || name.starts_with("GLOBAL_ATOMIC_")
+            || name.starts_with("FLAT_ATOMIC_")
+        {
+            return true;
+        }
+        matches!(
+            d.enc.name,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL"
+        ) && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let program = code;
+    let normalized;
+    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
+        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+        &normalized
+    } else {
+        opt
+    };
+    if !valid_window_count(opt.mem_windows as usize, opt.heap_windows) {
+        return Err(format!("unsupported shader memory layout: {} windows (heap: {})", opt.mem_windows, opt.heap_windows));
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1334,12 +1545,16 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
@@ -1349,6 +1564,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
+    }
+    if !opt.wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        em.reductions = wave32_reductions(&insts, &leaders);
     }
     em.max_vgpr = insts
         .iter()
@@ -1366,12 +1584,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
-        for (i, d) in insts.iter().enumerate() {
-            let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
-                break;
-            }
-        }
+        em.emit_insts(&insts, u64::MAX);
         body.push_str(&em.take());
         blocks = 1;
     } else {
@@ -1383,13 +1596,19 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, phase_split, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
-        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
+        let nested = nested_loop_ranges(&insts);
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
+        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
-            emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
+                return translate(program, &Options { structured: false, ..opt.clone() });
+            }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
