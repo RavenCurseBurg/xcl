@@ -119,6 +119,13 @@ class StallSummaryTests(unittest.TestCase):
         self.assertNotIn("Thread 21", report)
         self.assertEqual(summarize(lines), summarize([activity(8, 50), activity(10, 0), activity(12, 0)]))
 
+    def test_renamed_host_only_matches_that_module_above_the_title(self):
+        lines = [activity(8, 50),
+                 *thread_dump(9, "thread 42 '': xcl.exe+0x1 < xcl-main.EXE+0x2 < game.exe+0x3 < xcl-main.exe+0x4"),
+                 activity(10, 0)]
+        report = summarize(lines, title_exe="GAME.EXE", host_exe="XCL-MAIN.exe")
+        self.assertTrue(report.endswith("  Thread 42: 0x2"))
+
     def test_ignores_dumps_at_opening_sample_outside_window_and_after_shutdown(self):
         report = summarize([
             activity(8, 50),
