@@ -19,7 +19,7 @@ function New-Object([string]$TypeName) {
     Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName @args
 }
 
-function Assert-Exit([bool]$ExitedInTime, [string]$Expected) {
+function Assert-Exit([bool]$ExitedInTime, [string]$Expected, [hashtable]$Timing = @{}, [int]$ExpectedWait = 180000) {
     $process = [pscustomobject]@{
         StartInfo = $null
         StandardOutput = [IO.StringReader]::new("Log: $log")
@@ -27,12 +27,19 @@ function Assert-Exit([bool]$ExitedInTime, [string]$Expected) {
         ExitedInTime = $ExitedInTime
         HasExited = $ExitedInTime
         ExitCode = 0
+        WaitMilliseconds = 0
     }
     $process | Add-Member ScriptMethod Start { $true }
-    $process | Add-Member ScriptMethod WaitForExit { if ($args.Count) { $this.ExitedInTime } }
+    $process | Add-Member ScriptMethod WaitForExit {
+        if ($args.Count) {
+            $this.WaitMilliseconds = $args[0]
+            $this.ExitedInTime
+        }
+    }
     $process | Add-Member ScriptMethod Kill { $this.HasExited = $true }
 
-    $output = & $Smoke -Game $fixture -Xcl $PSCommandPath
+    $output = & $Smoke -Game $fixture -Xcl $PSCommandPath @Timing
+    if ($process.WaitMilliseconds -ne $ExpectedWait) { throw "Unexpected wait: $($process.WaitMilliseconds) ms" }
     if (($output -split "\r?\n") -notcontains "exit: $Expected") {
         throw "Expected exit: $Expected; smoke output: $output"
     }
@@ -47,7 +54,7 @@ try {
     Assert-Exit $true '0x0'
     $timedOut = $true
     Assert-Exit $true '0x0'
-    Assert-Exit $false 'killed (no exit)'
+    Assert-Exit $false 'killed (no exit)' @{ Seconds = 1; StartupTimeoutSeconds = 3 } 4000
 } finally {
     $env:XCL_NETWORK = $oldNetwork
     $env:XCL_RUN_SECONDS = $oldSeconds
