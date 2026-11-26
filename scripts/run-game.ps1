@@ -41,8 +41,12 @@ $XclExe = Join-Path $RepoRoot "target\release\xcl.exe"
 if (-not (Test-Path $XclExe)) {
     Write-Host "Building release xcl.exe..." -ForegroundColor Yellow
     Push-Location $RepoRoot
-    cargo build --release -p xcl
-    Pop-Location
+    try {
+        cargo build --release -p xcl
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } finally {
+        Pop-Location
+    }
 }
 
 Write-Host "XCL Game Launcher" -ForegroundColor Cyan
@@ -55,4 +59,5 @@ if ($env:XCL_DXC_THREADS) {
 }
 
 & $XclExe run $GamePath $ExtraArgs
+exit $LASTEXITCODE
 
