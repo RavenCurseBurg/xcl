@@ -158,10 +158,10 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     if mf and (pf is None or pf < FRAMES_KEPT * mf):
                         problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
-                    if pc is None:
-                        problems.append("the PR's regression run needs a numeric peak commit measurement")
-                    if mc is None:
-                        problems.append("the main regression run needs a numeric peak commit measurement")
+                    if not pc:
+                        problems.append("the PR's regression run needs a positive peak commit measurement")
+                    if not mc:
+                        problems.append("the main regression run needs a positive peak commit measurement")
                     if pc and mc and pc > COMMIT_GROWTH * mc:
                         problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
     return problems

@@ -330,6 +330,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ## Tests
 
+For a runtime PR, include a positive peak memory measurement in MB from each smoke run.
+See [Contributing to XCL](CONTRIBUTING.md) for the regression checks.
+
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
