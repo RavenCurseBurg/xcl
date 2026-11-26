@@ -12,8 +12,15 @@ $mockLog = Join-Path $runDir 'mock.log'
 $mockReport = Join-Path $runDir 'report.json'
 $outDir1 = Join-Path $fixture 'artifacts1'
 $outDir2 = Join-Path $fixture 'artifacts2'
+$childSettings = Join-Path $fixture 'child-settings.txt'
+$callerSettings = @{ XCL_NETWORK = '1'; XCL_RUN_SECONDS = '91'; XCL_ACTIVITY = 'other'; XCL_D3D12_DEBUG = 'previous' }
+$savedSettings = @{}
 
 try {
+    foreach ($name in $callerSettings.Keys) {
+        $savedSettings[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $callerSettings[$name])
+    }
     # Generate mock log and report
     @"
 [00:00:01] activity (2 s): 30 presents
@@ -23,20 +30,29 @@ try {
 (90 frames shown, 90 PresentX calls)
 "@ | Set-Content -LiteralPath $mockLog -Encoding utf8
 
-    '{"d3d12": {"adapter": "Mock Synthetic Adapter (16384 MB VRAM)"}}' |
+    '{"d3d12": {"adapter": "Mock Synthetic Adapter (16384 MB VRAM)", "debug_layer": [{"id": 42, "count": 2}]}}' |
         Set-Content -LiteralPath $mockReport -Encoding utf8
 
     # Mock XCL script outputs Log: path
     @"
 @echo off
 echo Running mock game...
+echo %XCL_NETWORK%,%XCL_RUN_SECONDS%,%XCL_ACTIVITY%,%XCL_D3D12_DEBUG% > "%~dp0child-settings.txt"
 echo Log: $mockLog
 exit /b 0
 "@ | Set-Content -LiteralPath $mockXcl -Encoding Ascii
 
     # Run 1: with report.json present
-    $output1 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir1 -Title 'MockRun1'
+    $output1 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir1 -Title 'MockRun1' -DebugLayer
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 1" }
+
+    $settings = (Get-Content -LiteralPath $childSettings -Raw).Trim()
+    if ($settings -ne '0,5,1,1') { throw "unexpected smoke launcher settings: $settings" }
+    foreach ($name in $callerSettings.Keys) {
+        if ([Environment]::GetEnvironmentVariable($name) -cne $callerSettings[$name]) {
+            throw "smoke.ps1 changed the caller's $name"
+        }
+    }
 
     if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 1 did not preserve xcl.log' }
     if (-not (Test-Path (Join-Path $outDir1 'report.json'))) { throw 'run 1 did not preserve report.json' }
@@ -51,6 +67,7 @@ exit /b 0
     $smokeBlock = $output1 -join "`n"
     if ($smokeBlock -notmatch 'xcl-smoke v1') { throw "smoke block missing header: $smokeBlock" }
     if ($smokeBlock -notmatch 'gpu: Mock Synthetic Adapter') { throw "smoke block missing mock gpu: $smokeBlock" }
+    if ($smokeBlock -notmatch 'debug layer messages: 42x2') { throw 'smoke block missing debug message counts' }
 
     # Run 2: remove report.json to test missing report case; reuse $outDir1 to verify stale report.json is purged
     Remove-Item -LiteralPath $mockReport -Force
@@ -67,6 +84,13 @@ exit /b 0
 
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
+    foreach ($name in $savedSettings.Keys) {
+        if ($null -eq $savedSettings[$name]) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $savedSettings[$name])
+        }
+    }
     if (Test-Path -LiteralPath $fixture) {
         Remove-Item -LiteralPath $fixture -Recurse -Force
     }

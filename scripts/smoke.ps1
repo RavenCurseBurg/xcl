@@ -2,11 +2,14 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-DebugLayer] [-OutDir <path>]
 #
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
 # -Title prints the given label instead. Use the same one for the main and the PR run.
+#
+# -DebugLayer runs the title with the D3D12 debug layer on, so the block's `debug layer messages`
+# line has ids in it; it needs the Graphics Tools optional feature, and both runs of a pair get it.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
@@ -14,7 +17,8 @@ param(
     [int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
     [string]$Title,
-    [string]$OutDir
+    [string]$OutDir,
+    [switch]$DebugLayer
 )
 $ErrorActionPreference = 'Stop'
 
@@ -53,9 +57,10 @@ $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $p = New-Object System.Diagnostics.Process
 $p.StartInfo = $psi
-$env:XCL_NETWORK = '0'
-$env:XCL_RUN_SECONDS = "$Seconds"
-$env:XCL_ACTIVITY = '1'
+$psi.EnvironmentVariables['XCL_NETWORK'] = '0'
+$psi.EnvironmentVariables['XCL_RUN_SECONDS'] = "$Seconds"
+$psi.EnvironmentVariables['XCL_ACTIVITY'] = '1'
+if ($DebugLayer) { $psi.EnvironmentVariables['XCL_D3D12_DEBUG'] = '1' }
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
@@ -66,7 +71,6 @@ if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
@@ -83,9 +87,17 @@ $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with statu
 # the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
+$dl = 'n/a'
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
 if (Test-Path $report) {
-    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+    try {
+        $rep = Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json
+        $gpu = $rep.d3d12.adapter -replace '\s*\([^()]*VRAM\)$', ''
+        if ($null -ne $rep.d3d12.debug_layer) {
+            $dl = (@($rep.d3d12.debug_layer | ForEach-Object { "$($_.id)x$($_.count)" }) -join ' ')
+            if (-not $dl) { $dl = 'none' }
+        }
+    } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
@@ -132,5 +144,6 @@ presents per 2 s (last 3): $lastPresents
 device removals: $removals
 crashes: $crashes
 peak commit: $peak MB
+debug layer messages: $dl
 ``````
 "@
