@@ -1,19 +1,25 @@
 # Run with powershell.exe or pwsh.exe. The fixture writes stderr through a native process.
 $ErrorActionPreference = 'Stop'
 $runner = Join-Path $PSScriptRoot 'test.ps1'
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-native-stderr-' + [guid]::NewGuid())
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-native-stderr-[fixture]-' + [guid]::NewGuid())
 $null = New-Item -ItemType Directory -Path $fixture
 $cargo = Join-Path $fixture 'cargo.cmd'
 $log = Join-Path $fixture 'runner.log'
 $calls = Join-Path $fixture 'calls.log'
 $wrapper = Join-Path $fixture 'run.ps1'
+$testScripts = Join-Path $fixture 'scripts'
+$testRunner = Join-Path $testScripts 'test.ps1'
 $shell = (Get-Process -Id $PID).Path
 $oldPath = $env:PATH
 try {
+    # Run the success case from a bracketed checkout, even if the real checkout has a plain path.
+    $null = [IO.Directory]::CreateDirectory($testScripts)
+    [IO.File]::Copy($runner, $testRunner)
     # Keep redirection inside the child shell to exercise PowerShell 5.1's native stderr handling.
     [IO.File]::WriteAllText($wrapper, @'
-param($Runner, $Log)
-& $Runner *> $Log
+param($Runner)
+Set-Location -LiteralPath $PSScriptRoot
+& $Runner *> runner.log
 exit $LASTEXITCODE
 '@)
     $nativeCargo = @'
@@ -49,7 +55,8 @@ exit /b 127
         # A failing child may write stderr too; do not let the parent turn it into a terminating error.
         $ErrorActionPreference = 'Continue'
         try {
-            $shellOutput = & $shell -NoProfile -NonInteractive -File $wrapper $runner $log 2>&1
+            $caseRunner = if ($case.Name -eq 'success') { $testRunner } else { $runner }
+            $shellOutput = & $shell -NoProfile -NonInteractive -File $wrapper $caseRunner 2>&1
             $code = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = 'Stop'
@@ -77,7 +84,7 @@ exit /b 127
     }
 } finally {
     $env:PATH = $oldPath
-    foreach ($path in $cargo, $log, $calls, $wrapper, $fixture) {
+    foreach ($path in $cargo, $log, $calls, $wrapper, $testRunner, $testScripts, $fixture) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
 }

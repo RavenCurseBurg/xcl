@@ -149,6 +149,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
 
+The test runner accepts checkout paths with spaces and square brackets, such as `C:\dev\XCL [local]`.
+
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
 another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
