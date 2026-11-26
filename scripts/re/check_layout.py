@@ -138,7 +138,7 @@ def main(argv=None):
             continue
         if proc.returncode != 0:
             errors += 1
-            detail = proc.stderr.strip() or f'exit code {proc.returncode}'
+            detail = proc.stderr.strip() or proc.stdout.strip() or f'exit code {proc.returncode}'
             print(f'{name}: xcl disasm failed ({proc.returncode}): {detail}', file=sys.stderr)
             continue
         file_ok, file_bad = check_listing(name, proc.stdout, consts, descs)

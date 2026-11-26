@@ -155,6 +155,13 @@ class CheckLayoutDirectoryAndCliTests(unittest.TestCase):
             self.assertIn("xcl: invalid shader container", err)
             self.assertIn("disassembler errors: 1", err)
 
+            failed.stderr = "  \n"
+            failed.stdout = "stdout-only diagnostic\n"
+            with patch.object(self.mod.subprocess, "run", return_value=failed):
+                rc, _, err = self._run_main([str(root), "--xcl", str(xcl)])
+            self.assertEqual(rc, 1)
+            self.assertIn("00.dxbc: xcl disasm failed (2): stdout-only diagnostic", err)
+
     def test_missing_xcl_returns_1(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing_xcl = Path(tmp) / "missing_xcl.exe"
