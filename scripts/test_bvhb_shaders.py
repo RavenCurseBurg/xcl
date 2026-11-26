@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "re"))
 import bvhb_shaders
@@ -20,7 +21,52 @@ def build_synthetic_dxbc(chunk_type=b"RTS0", chunk_data=b""):
     return blob
 
 
+def summarize_root(root, folder):
+    source = folder / "synthetic.dll"
+    source.write_bytes(build_synthetic_dxbc(b"RTS0", root))
+    return subprocess.run(
+        [sys.executable, "-B", str(SCRIPT), str(source), str(folder / "out")],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
 class RootDescriptorTests(unittest.TestCase):
+    def test_unbounded_ranges_on_a_legacy_output_encoding(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                root = struct.pack("<6I", version, 1, 24, 0, 0, 0)
+                root += struct.pack("<3I2I", 0, 0, 36, 2, 44)
+                for count, space, offset in ((2, 0, 0), (0xFFFFFFFF, 5, 2)):
+                    root += struct.pack("<4I", 0, count, 0, space)
+                    if version == 2:
+                        root += struct.pack("<I", 1)
+                    root += struct.pack("<I", offset)
+                with patch.dict("os.environ", PYTHONIOENCODING="cp1252:strict"):
+                    text = summarize_root(root, Path(tmp))
+                self.assertIn("table[SRVx2@0,SRVxunbounded@0 space5]", text)
+
+    def test_distinguishes_bindings_in_different_register_spaces(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                constants = struct.pack("<3I", 0, 2, 4)
+                descriptor = struct.pack("<2I", 0, 3)
+                if version == 2:
+                    descriptor += struct.pack("<I", 0)
+                constants_at = 24 + 3 * 12
+                descriptor_at = constants_at + len(constants)
+                table_at = descriptor_at + len(descriptor)
+                root = bytearray(struct.pack("<6I", version, 3, 24, 0, 0, 0))
+                for kind, offset in ((1, constants_at), (2, descriptor_at), (0, table_at)):
+                    root += struct.pack("<3I", kind, 0, offset)
+                root += constants + descriptor + struct.pack("<2I", 2, table_at + 8)
+                for space, table_offset in ((0, 0), (5, 1)):
+                    root += struct.pack("<4I", 0, 1, 0, space)
+                    if version == 2:
+                        root += struct.pack("<I", 0)
+                    root += struct.pack("<I", table_offset)
+                text = summarize_root(root, Path(tmp))
+                self.assertIn("consts b0 space2 x4 | CBV b0 space3 | table[SRVx1@0,SRVx1@0 space5]", text)
+
     def test_root_descriptors_print_their_register_classes(self):
         for version in (1, 2):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:

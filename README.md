@@ -175,6 +175,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+`python scripts/re/bvhb_shaders.py <input> [out-dir]` extracts embedded DXBC containers.
+Root-signature summaries show nonzero register spaces and label unbounded descriptor ranges as `unbounded`.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

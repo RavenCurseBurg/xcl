@@ -28,6 +28,10 @@ def parts(blob):
         yield cc, blob[off + 8:off + 8 + size]
 
 
+def space_suffix(space):
+    return f' space{space}' if space else ''
+
+
 def rts0(r):
     if len(r) < 24:
         return None
@@ -50,21 +54,21 @@ def rts0(r):
                     break
                 w = struct.unpack_from('<6I' if ver >= 2 else '<5I', r, range_off)
                 range_name = RANGE.get(w[0], f'?{w[0]}')
-                count_str = f'{w[1]}' if w[1] != 0xFFFFFFFF else '∞'
-                rs.append(f'{range_name}x{count_str}@{w[2]}')
+                count = w[1] if w[1] != 0xFFFFFFFF else 'unbounded'
+                rs.append(f'{range_name}x{count}@{w[2]}{space_suffix(w[3])}')
             out.append('table[' + ','.join(rs) + ']')
         elif ty == 1:
             if len(r) < pay + 12:
                 break
             reg, space, num = struct.unpack_from('<3I', r, pay)
-            out.append(f'consts b{reg} x{num}')
+            out.append(f'consts b{reg}{space_suffix(space)} x{num}')
         else:
             if len(r) < pay + 8:
                 break
             reg, space = struct.unpack_from('<2I', r, pay)
             type_name = TYPES.get(ty, f'?{ty}')
             reg_class = "btu"[ty - 2] if 2 <= ty < 5 else '?'
-            out.append(f'{type_name} {reg_class}{reg}')
+            out.append(f'{type_name} {reg_class}{reg}{space_suffix(space)}')
     return f'v{ver} flags {flags:#x} samplers {ns}: ' + ' | '.join(out)
 
 
