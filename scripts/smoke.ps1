@@ -94,10 +94,16 @@ if ($OutDir) {
     if (-not (Test-Path -LiteralPath $OutDir)) {
         $null = New-Item -ItemType Directory -Path $OutDir -Force
     }
-    Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir 'xcl.log') -Force
-    $destReport = Join-Path $OutDir 'report.json'
+    $artifacts = (Get-Item -LiteralPath $OutDir).FullName
+    $destLog = Join-Path $artifacts 'xcl.log'
+    if (-not [string]::Equals((Get-Item -LiteralPath $log).FullName, $destLog, [StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item -LiteralPath $log -Destination $destLog -Force
+    }
+    $destReport = Join-Path $artifacts 'report.json'
     if (Test-Path -LiteralPath $report) {
-        Copy-Item -LiteralPath $report -Destination $destReport -Force
+        if (-not [string]::Equals((Get-Item -LiteralPath $report).FullName, $destReport, [StringComparison]::OrdinalIgnoreCase)) {
+            Copy-Item -LiteralPath $report -Destination $destReport -Force
+        }
     } elseif (Test-Path -LiteralPath $destReport) {
         Remove-Item -LiteralPath $destReport -Force
     }
