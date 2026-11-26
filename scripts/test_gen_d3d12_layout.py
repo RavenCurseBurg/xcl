@@ -117,6 +117,23 @@ class GenD3D12LayoutCliTests(unittest.TestCase):
             self.assertIn("pub static IFACES: &[Iface] = &[", content)
             self.assertIn('Iface { name: "ID3D12Device", iid: "189819f1-1db6-4b57-be54-1821339b85f7", parent: "ID3D12Object"', content)
 
+    def test_missing_device_preserves_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "debug.h"
+            dst = Path(tmp) / "layout.rs"
+            src.write_text(SAMPLE_HEADER.replace("ID3D12Device", "ID3D12Debug"), encoding="utf-8")
+            for existing in (False, True):
+                with self.subTest(existing=existing):
+                    if existing:
+                        dst.write_bytes(b"previous layout\n")
+                    result = subprocess.run([sys.executable, "-B", str(SCRIPT), str(src), str(dst)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("no ID3D12Device", result.stderr)
+                    self.assertEqual(dst.exists(), existing)
+                    if existing:
+                        self.assertEqual(dst.read_bytes(), b"previous layout\n")
+
 
 class GenD3D12LayoutGenerateTests(unittest.TestCase):
     def test_generate_parses_interfaces_and_deduplicates_methods(self):
@@ -133,6 +150,10 @@ class GenD3D12LayoutGenerateTests(unittest.TestCase):
     def test_generate_rejects_empty_input(self):
         with self.assertRaises(ValueError):
             generate("int x = 42;")
+
+    def test_generate_rejects_device_without_methods(self):
+        with self.assertRaisesRegex(ValueError, "no methods parsed for ID3D12Device"):
+            generate(SAMPLE_HEADER.replace("STDMETHODCALLTYPE", "unused"))
 
 
 if __name__ == "__main__":

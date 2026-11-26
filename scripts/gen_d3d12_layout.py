@@ -52,9 +52,13 @@ def generate(text):
     out.append("];\n")
 
     devices = [n for n in names if re.fullmatch(r"ID3D12Device\d*", n)]
-    dev = max(devices, key=lambda n: len(vtbls[n])) if devices else None
-    dev_count = len(vtbls[dev]) if dev else 0
-    return "\n".join(out), names, dev, dev_count
+    if not devices:
+        raise ValueError("no ID3D12Device interface found (expected d3d12.h)")
+    for device in devices:
+        if not vtbls[device]:
+            raise ValueError(f"no methods parsed for {device} (expected d3d12.h)")
+    dev = max(devices, key=lambda n: len(vtbls[n]))
+    return "\n".join(out), names, dev, len(vtbls[dev])
 
 
 def main(argv=None):
@@ -80,7 +84,7 @@ def main(argv=None):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     open(dst, "w", encoding="utf-8", newline="\n").write(content)
-    dev_msg = f"most derived device {dev} with {dev_count} methods" if dev else "no device interface"
+    dev_msg = f"most derived device {dev} with {dev_count} methods"
     print(f"{len(names)} interfaces; {dev_msg} -> {os.path.normpath(dst)}")
     return 0
 
