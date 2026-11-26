@@ -110,6 +110,7 @@ def main(argv=None):
         return 1
 
     ok = bad = errors = 0
+    valid_files = invalid_files = 0
     for name in sorted(os.listdir(args.dir)):
         path = os.path.join(args.dir, name)
         if not os.path.isfile(path) or not name.lower().endswith('.dxbc'):
@@ -118,12 +119,12 @@ def main(argv=None):
             blob = f.read()
         try:
             rs = next((p for cc, p in parts(blob) if cc == 'RTS0'), None)
-            if rs is None:
-                continue
             lay = layout(rs)
         except ValueError as exc:
+            invalid_files += 1
             print(f'{name}: skipping invalid DXBC ({exc})', file=sys.stderr)
             continue
+        valid_files += 1
         if lay is None:
             continue
         consts, descs, _ = lay
@@ -148,6 +149,9 @@ def main(argv=None):
     print(f'loads on parameter boundaries: {ok}, off: {bad}')
     if errors:
         print(f'disassembler errors: {errors}', file=sys.stderr)
+    if invalid_files and not valid_files:
+        print('no valid DXBC files in the input', file=sys.stderr)
+        return 1
     return 1 if (bad > 0 or errors > 0) else 0
 
 

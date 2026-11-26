@@ -155,6 +155,18 @@ class CheckLayoutDirectoryAndCliTests(unittest.TestCase):
             self.assertIn("xcl: invalid shader container", err)
             self.assertIn("disassembler errors: 1", err)
 
+    def test_only_malformed_files_returns_1_without_running_disassembly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xcl = root / "xcl.exe"
+            xcl.touch()
+            (root / "short.dxbc").write_bytes(b"DXBC")
+            with patch.object(self.mod.subprocess, "run") as disasm:
+                rc, _, err = self._run_main([str(root), "--xcl", str(xcl)])
+            disasm.assert_not_called()
+            self.assertEqual(rc, 1)
+            self.assertIn("no valid DXBC", err)
+
     def test_missing_xcl_returns_1(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing_xcl = Path(tmp) / "missing_xcl.exe"
