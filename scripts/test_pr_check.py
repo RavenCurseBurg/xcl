@@ -178,5 +178,44 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+class MultiSmokeBlockTests(unittest.TestCase):
+    def test_missing_field_is_reported_for_either_pr_block(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+
+        def block(commit, run):
+            return f"```\nxcl-smoke v1\ncommit: {commit}\n{run}```\n"
+
+        main = block("1111111aaaa", CLEAN_RUN)
+        valid = block(HEAD, CLEAN_RUN)
+        incomplete = block(HEAD, CLEAN_RUN.replace("peak commit: 3000 MB\n", ""))
+        for pair in (incomplete + valid, valid + incomplete):
+            with self.subTest(pair=pair):
+                problems = check(BODY + main + pair, HEAD, files, lambda sha: sha == "1111111aaaa")
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn("no `peak commit` line", problems[0])
+
+    def test_earlier_pr_smoke_block_failures_are_not_hidden_by_a_later_clean_block(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        main_a = "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: A\nseconds: 60\nframes shown: 500\npeak commit: 1000 MB\ndevice removals: 0\ncrashes: 0\n```\n"
+        bad_pr_a = "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: A\nseconds: 60\nexit: killed (no exit)\nframes shown: 10\npeak commit: 9999 MB\ndevice removals: 2\ncrashes: 1\n```\n"
+        main_b = "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: B\nseconds: 60\nframes shown: 100\npeak commit: 1000 MB\ndevice removals: 0\ncrashes: 0\n```\n"
+        good_pr_b = "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: B\nseconds: 60\nexit: 0x0\nframes shown: 100\npeak commit: 1000 MB\ndevice removals: 0\ncrashes: 0\n```\n"
+        problems = check(BODY + main_a + bad_pr_a + main_b + good_pr_b, HEAD, files, lambda sha: sha == "1111111aaaa")
+        for expected in ("device removals: 2", "crashes: 1", "killed", "fewer frames", "more memory"):
+            self.assertTrue(any(expected in p for p in problems), (expected, problems))
+
+    def test_multiple_clean_pr_blocks_all_pass(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        run = "seconds: 60\nexit: 0x0\nframes shown: 100\npeak commit: 1000 MB\ndevice removals: 0\ncrashes: 0\n"
+        body = (
+            f"{BODY}"
+            f"```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: A\n{run}```\n"
+            f"```\nxcl-smoke v1\ncommit: 1234567890\ntitle: A\n{run}```\n"
+            f"```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: B\n{run}```\n"
+            f"```\nxcl-smoke v1\ncommit: 1234567890\ntitle: B\n{run}```\n"
+        )
+        self.assertEqual([], check(body, HEAD, files, lambda sha: sha == "1111111aaaa"))
+
+
 if __name__ == "__main__":
     unittest.main()
