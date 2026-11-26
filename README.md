@@ -160,6 +160,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+`scripts/pr_check.py --body` accepts PR descriptions saved as UTF-8, including files written
+by Windows PowerShell with `Set-Content -Encoding UTF8`.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

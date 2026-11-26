@@ -86,8 +86,8 @@ def heading(names):
     """A heading of one of `names`, in either case: `**Tested**` as in the template, or a markdown
     heading on a line of its own (`## Tested`, `### **Tested**`)."""
     alt = "|".join(re.escape(n) for n in names)
-    return (r"(?im:\*\*(?:" + alt + r")\*\*|^[ \t]*#{1,6}[ \t]+(?:\*\*)?(?:" + alt
-            + r")(?:\*\*)?[ \t]*#*[ \t]*$)")
+    return (r"(?im:^ {0,3}(?:\*\*(?:" + alt + r")\*\*|#{1,6}[ \t]+(?:\*\*)?(?:" + alt
+            + r")(?:\*\*)?[ \t]*#*[ \t]*$))")
 
 
 def mask_fences(body):
@@ -111,10 +111,12 @@ def mask_fences(body):
 
 def section_has_content(body, section):
     """True when the `**section**` heading exists and has at least one non-placeholder line."""
-    m = re.search(heading([section]) + r"[ \t]*\n(.*?)(?=\n" + heading(HEADINGS) + r"|\Z)", body, re.S)
-    if not m:
+    start = re.search(heading([section]) + r"[ \t]*(?=\n|\Z)", body)
+    if not start:
         return False
-    text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
+    end = re.compile(r"\n" + heading(HEADINGS)).search(body, start.end())
+    text = body[start.end():end.start() if end else len(body)]
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     for raw in text.splitlines():
         line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
         if line and line not in TEMPLATE_PLACEHOLDERS:
@@ -199,7 +201,8 @@ def main():
     a.add_argument("--local", action="store_true")
     a.add_argument("--test-only", action="store_true", help="skip the retail smoke check for an approved test-only diff")
     o = a.parse_args()
-    body = open(o.body, encoding="utf-8").read()
+    with open(o.body, encoding="utf-8-sig") as body_file:
+        body = body_file.read()
     def blob_size(sha):
         if o.local:
             r = subprocess.run(["git", "cat-file", "-s", sha], capture_output=True, text=True)
