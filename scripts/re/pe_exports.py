@@ -29,6 +29,7 @@ def parse_exports(b):
     dd = opt + (112 if magic == 0x20B else 96)
     if len(b) < dd + 8:
         raise ValueError("truncated data directories")
+    headers_size = struct.unpack_from("<I", b, opt + 60)[0]
     exp_rva, exp_size = struct.unpack_from("<II", b, dd)
     secs = []
     so = opt + struct.unpack_from("<H", b, pe + 20)[0]
@@ -40,6 +41,8 @@ def parse_exports(b):
         secs.append((va, max(vs, raw_sz), raw))
 
     def off(rva):
+        if 0 <= rva < min(headers_size, len(b)):
+            return rva
         for va, sz, raw in secs:
             if va <= rva < va + sz:
                 file_off = rva - va + raw
