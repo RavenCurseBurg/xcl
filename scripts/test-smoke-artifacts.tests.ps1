@@ -96,6 +96,13 @@ exit /b 0
     if (-not (Test-Path (Join-Path $outDir2 'manifest.json'))) { throw 'positional run did not write manifest.json in OutDir' }
     $manifestPos = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifestPos.title -ne 'PositionalRun') { throw "unexpected positional title: $($manifestPos.title)" }
+    if ($manifestPos.startup_timeout_seconds -ne 120) { throw 'Default startup timeout changed' }
+
+    $null = & $runner $gameDir 1 $mockXcl 'TimedRun' $outDir2 7 -Build Release
+    $timed = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($timed.title -ne 'TimedRun' -or $timed.startup_timeout_seconds -ne 7 -or $timed.build -cne 'release') {
+        throw 'Positional output directory, startup timeout or named build was lost'
+    }
 
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
