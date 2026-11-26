@@ -28,22 +28,23 @@ for i, (a, t) in enumerate(ins):
     bound, fallback = m2.group(1), int(m3.group(1), 16)
     body = []
     length = None
-    cursor_store = rf'mov\s+%\w+,0x18\(%{L}\)$'
+    cursor_store = rf'mov\s+%(\w+),0x18\(%{L}\)$'
     cursor_updated = False
     for j in range(i + 3, min(i + 60, len(ins))):
         address, tj = ins[j]
         if a < fallback <= address or re.match(r'retq?\b', tj):
             break
         body.append(tj)
-        ma = re.match(rf'(?:add\s+\$0x([0-9a-f]+),%{P}|lea\s+0x([0-9a-f]+)\(%(\w+)\),%\w+)$', tj)
-        if ma and ma.group(1):
+        ma = re.match(rf'add\s+\$0x([0-9a-f]+),%{P}$', tj)
+        if ma:
             length = int(ma.group(1), 16)
-        if re.match(cursor_store, tj):
+        store = re.match(cursor_store, tj)
+        if store:
             cursor_updated = True
             if length is None:
-                # lea 0xN(%rcx),%rax style
+                dst = store.group(1)
                 for tb in body:
-                    ml = re.match(r'lea\s+0x([0-9a-f]+)\(%\w+\),%\w+$', tb)
+                    ml = re.match(rf'lea\s+0x([0-9a-f]+)\(%{P}\),%{dst}$', tb)
                     if ml:
                         length = int(ml.group(1), 16)
             break

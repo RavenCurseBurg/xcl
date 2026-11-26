@@ -65,6 +65,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 
 `python scripts/re/record_writers.py <objdump-listing>` reports inline command-list
 writers whose cursor store appears before the fallback block or a return instruction.
+A length inferred from `lea` uses the record pointer and the register written back to the list.
 
 ### Media and tools
 
