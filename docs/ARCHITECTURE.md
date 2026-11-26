@@ -138,11 +138,11 @@ For running a title:
 | `XCL_SKIP_CPU_CHECK` | run even when the CPU lacks features of the console's CPU | `launcher.rs` |
 | `XCL_ADAPTER` | overrides `d3d12_adapter`: `auto`, `warp`, an index, or part of the adapter's name; also for the GPU tests | `gpu/adapter.rs` |
 | `XCL_DXC_DIR` | folder tried first for `dxcompiler.dll` / `dxil.dll` | `gpu/recomp/dxc.rs` |
-| `XCL_DXC_THREADS` | number of compile threads (default: every core but one) | `gpu/recomp/dxc.rs` |
+| `XCL_DXC_THREADS` | number of compile threads, from 1 to 64. The default is one fewer than the logical CPUs available to the process, within those limits | `gpu/recomp/dxc.rs` |
 | `XCL_D3D12_DIR` | folder of the D3D12 Agility SDK | `gpu/agility.rs` |
 | `XCL_D3D12_DEBUG` | turns on the D3D12 debug layer (like `d3d12_debug` in `xcl.toml`) | `hle/d3d12x/real.rs` |
 | `XCL_RAYTRACING` | overrides `raytracing` in `xcl.toml`: `off` / `0`, `tier1_0` / `10`, `tier1_1` / `11`; anything else keeps the GPU's tier | `config.rs` |
-| `XCL_UMA_MB` | size of the title's graphics memory in MB (default 2048; `uma_mb` in `xcl.toml` sets it when unset) | `gpu/uma.rs`, `host.rs` |
+| `XCL_UMA_MB` | size of the title's graphics memory in MiB. Overrides `uma_mb` in `xcl.toml`, which defaults to 4095 for advanced title memory and 2048 otherwise | `gpu/uma.rs`, `host.rs` |
 | `XCL_FRAME_DUMP` | `1`: every 120th shown frame as `frame_<n>.bmp` in the logs folder; `n > 1`: every n-th. `XCL_FRAME_DUMP_FULL=1`: full size | `hle/d3d12x/present.rs` |
 | `XCL_DUMP_SHADERS` | `1`: every shader the title submits is written to the title's `shaders` folder with its disassembly and HLSL | `gpu/shader.rs` |
 | `XCL_TRANSLATED_CACHE` | `0`: no disk cache of translated programs | `gpu/recomp/pso.rs` |
@@ -159,14 +159,14 @@ lists the ones not set):
 | Variable | What it does | Read in |
 |---|---|---|
 | `XCL_REQUIRE_GPU` | `wave64`, `mesh` or `wave64,mesh`: a GPU test skipped for that reason fails instead | `gpu/recomp/runner.rs` |
-| `XCL_SAMPLE_RPF` | a shader pack (`shaders.rpf`) | `gpu/recomp/tests.rs`, `shaders.rs`, `tests/gpu_pso_e2e.rs` |
-| `XCL_SAMPLE_DLLS` | folder of the game's console DLLs | `tests/console_dlls_e2e.rs` |
+| `XCL_SAMPLE_RPF` | a shader pack (`shaders.rpf`) | `gpu/recomp/tests.rs`, `shaders.rs`, `crates/xcl/tests/gpu_pso_e2e.rs` |
+| `XCL_SAMPLE_DLLS` | folder of the game's console DLLs | `crates/xcl/tests/console_dlls_e2e.rs` |
 | `XCL_SAMPLE_TTPF` | a texture archive | `gpu/texture.rs` |
-| `XCL_SAMPLE_BK2` | a Bink 2 movie (with `XCL_SAMPLE_DLLS`) | `tests/console_dlls_e2e.rs` |
-| `XCL_SAMPLE_BVH4` | the `core_bvh4.rpf` package (with `XCL_SAMPLE_DLLS`) | `tests/console_dlls_e2e.rs` |
+| `XCL_SAMPLE_BK2` | a Bink 2 movie (with `XCL_SAMPLE_DLLS`) | `crates/xcl/tests/console_dlls_e2e.rs` |
+| `XCL_SAMPLE_BVH4` | the `core_bvh4.rpf` package (with `XCL_SAMPLE_DLLS`) | `crates/xcl/tests/console_dlls_e2e.rs` |
 | `XCL_SAMPLE_AWC` | a sound | `hle/opus.rs` |
-| `XCL_SAMPLE_XG` | the console's own `xg_xs.dll` | `tests/xg_oracle.rs` |
-| `XCL_SAMPLE_DXC` | the console's `dxcompiler_xs.dll` (with `xbsc_xs.dll` next to it) | `tests/console_shaders.rs` |
+| `XCL_SAMPLE_XG` | the console's own `xg_xs.dll` | `crates/xcl/tests/xg_oracle.rs` |
+| `XCL_SAMPLE_DXC` | the console's `dxcompiler_xs.dll` (with `xbsc_xs.dll` next to it) | `crates/xcl/tests/console_shaders.rs` |
 
 The other `XCL_*` variables are debug and trace switches. List them with
 `grep -rn '"XCL_' crates/xcl/src`; each one's doc comment is next to the code that reads it.
