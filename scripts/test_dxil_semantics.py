@@ -21,7 +21,7 @@ INSPECTOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INSPECTOR)
 
 
-class SemanticFixtureTests(unittest.TestCase):
+class InspectorTests(unittest.TestCase):
     def test_explicit_missing_dxc_does_not_fall_back(self) -> None:
         with self.assertRaisesRegex(FileNotFoundError, "specified dxc.exe does not exist"):
             INSPECTOR.find_dxc(str(HERE / "missing-dxc.exe"))
@@ -35,6 +35,8 @@ class SemanticFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple entry points"):
             INSPECTOR._entry_metadata("!dx.entryPoints = !{!1, !2}", {1: "!{}", 2: "!{}"})
 
+
+class SemanticFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         try:
@@ -119,7 +121,7 @@ def main() -> int:
     DXC_OVERRIDE = args.dxc
     global REQUIRE_DXC
     REQUIRE_DXC = args.require_dxc
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(SemanticFixtureTests)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
