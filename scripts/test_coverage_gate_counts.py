@@ -51,6 +51,21 @@ class CounterTests(unittest.TestCase):
                     self.assertIn(f"CS.{field}", err)
                     self.assertEqual(self.baseline.read_bytes(), original)
 
+    def test_inconsistent_total_fails_compare_and_update(self):
+        original = self.baseline.read_bytes()
+        for total in (9, 11):
+            for extra in ((), ("--update",)):
+                with self.subTest(total=total, extra=extra):
+                    code, _, err = self.invoke(report(total=total), *extra)
+                    self.assertEqual(code, 2)
+                    self.assertIn("CS.total", err)
+                    self.assertEqual(self.baseline.read_bytes(), original)
+
+    def test_balanced_nonzero_outcomes_can_be_updated(self):
+        run = report(translated=4, unsupported=3, validator_failed=1, panicked=1, timeout=1)
+        self.assertEqual(self.invoke(run, "--update")[0], 0)
+        self.assertEqual(json.loads(self.baseline.read_bytes()), run)
+
     def test_invalid_counts_cannot_create_a_baseline(self):
         self.baseline.unlink()
         code, _, _ = self.invoke(report(timeout=-1), "--update")

@@ -324,6 +324,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ## Tests
 
+`python scripts/coverage_gate.py --run-json <report>` checks that each shader stage's total
+matches its five outcome counts. An inconsistent report exits with code 2 and leaves the
+coverage baseline untouched, including when `--update` is supplied.
+
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```

@@ -20,6 +20,7 @@ from pathlib import Path
 
 DEFAULT_BASELINE = Path(__file__).resolve().parent.parent / "tests" / "data" / "coverage-baseline.json"
 WORSEN = ("validator_failed", "panicked", "timeout")
+OUTCOMES = ("translated", "unsupported", *WORSEN)
 
 
 def sweep_json(stdout):
@@ -36,12 +37,15 @@ def validate_counts(report):
     for stage, counts in report["stages"].items():
         if not isinstance(counts, dict):
             raise ValueError(f"{stage}: stage counters must be an object")
-        for field in ("total", "translated", "unsupported", *WORSEN):
+        for field in ("total", *OUTCOMES):
             value = counts.get(field)
             # bool is an int subclass, and json.loads accepts NaN/Infinity by default.
             # Neither is a count; NaN would make both regression comparisons false.
             if type(value) is not int or value < 0:
                 raise ValueError(f"{stage}.{field}: expected a non-negative integer")
+        expected = sum(counts[field] for field in OUTCOMES)
+        if counts["total"] != expected:
+            raise ValueError(f"{stage}.total: expected {expected} from outcome counts, got {counts['total']}")
 
 
 def compare(baseline, run):
