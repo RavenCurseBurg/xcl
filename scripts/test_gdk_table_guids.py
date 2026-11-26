@@ -29,6 +29,7 @@ class GdkTableGuidTests(unittest.TestCase):
 
             for cls, iface, field in (
                 ("f" * 36, interface_guid, "class"),
+                ("bad//guid", interface_guid, "class"),
                 (class_guid, interface_guid[:-1], "interface"),
                 (class_guid, interface_guid.replace("-", "", 1) + "-", "interface"),
             ):
