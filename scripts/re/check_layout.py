@@ -43,17 +43,22 @@ def layout(r):
 
 
 def check_directory(dirpath, xcl_bin=None):
+    return _check_directory_status(dirpath, xcl_bin) == 0
+
+
+def _check_directory_status(dirpath, xcl_bin=None):
     xcl = xcl_bin or find_xcl()
     if not os.path.isfile(xcl):
         print(f"error: xcl binary not found at '{xcl}'; build target/debug/xcl.exe, target/release/xcl.exe or set XCL_EXE", file=sys.stderr)
-        return False
+        return 1
 
     ok = bad = 0
     for name in sorted(os.listdir(dirpath)):
         filepath = os.path.join(dirpath, name)
         if not os.path.isfile(filepath):
             continue
-        blob = open(filepath, 'rb').read()
+        with open(filepath, 'rb') as shader:
+            blob = shader.read()
         rs = next((p for cc, p in parts(blob) if cc == 'RTS0'), None)
         if not rs:
             continue
@@ -61,7 +66,14 @@ def check_directory(dirpath, xcl_bin=None):
         if lay is None:
             continue
         consts, descs, size = lay
-        lst = subprocess.run([xcl, 'disasm', filepath], capture_output=True, text=True, encoding='utf-8', errors='replace').stdout
+        disasm = subprocess.run([xcl, 'disasm', filepath], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if disasm.returncode:
+            print(f'{name}: xcl disasm exited with code {disasm.returncode}', file=sys.stderr)
+            diagnostic = disasm.stderr.strip() or disasm.stdout.strip()
+            if diagnostic:
+                print(diagnostic, file=sys.stderr)
+            return disasm.returncode
+        lst = disasm.stdout
         # the pair the table pointer was copied to: s_mov sA, s0 ; s_and sB, s1, 0xff
         m = re.search(r's_and_b32 s(\d+), s1, 0xff\s', lst)
         if not m or not re.search(rf's_mov_b32 s{int(m.group(1)) - 1}, s0\s', lst):
@@ -79,7 +91,7 @@ def check_directory(dirpath, xcl_bin=None):
                 bad += 1
                 print(f'{name}: load {nbytes} B @{off:#x} not on a parameter (descriptors {sorted(descs)}, constants {consts})')
     print(f'loads on parameter boundaries: {ok}, off: {bad}')
-    return bad == 0
+    return 1 if bad else 0
 
 
 def main(argv=None):
@@ -91,7 +103,7 @@ def main(argv=None):
     if not os.path.isdir(dirpath):
         print(f"error: directory not found: '{dirpath}'", file=sys.stderr)
         return 1
-    return 0 if check_directory(dirpath) else 1
+    return _check_directory_status(dirpath)
 
 
 if __name__ == '__main__':

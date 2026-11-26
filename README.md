@@ -156,6 +156,10 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+Run `python scripts/re/check_layout.py <shader-directory>` to check root-argument layouts.
+Set `XCL_EXE` to select a specific build. If disassembly fails, the checker prints the
+shader filename and diagnostic, stops scanning, and exits with the disassembler's status.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

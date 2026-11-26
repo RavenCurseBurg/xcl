@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 from pathlib import Path
 import struct
@@ -5,9 +7,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "re"))
-from check_layout import layout, parts, find_xcl
+from check_layout import layout, main, parts, find_xcl
 
 
 SCRIPT = Path(__file__).resolve().parent / "re" / "check_layout.py"
@@ -97,6 +100,33 @@ class CheckLayoutLayoutTests(unittest.TestCase):
 
 
 class CheckLayoutEndToEndTests(unittest.TestCase):
+    def test_disasm_failure_stops_the_scan(self):
+        root = struct.pack("<3I", 1, 0, 12)
+        chunk = b"RTS0" + struct.pack("<I", len(root)) + root
+        blob = struct.pack("<4s16sIIII", b"DXBC", bytes(16), 1, 36 + len(chunk), 1, 36) + chunk
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"XCL_EXE": sys.executable}):
+            shader = Path(tmp) / "first.dxbc"
+            shader.write_bytes(blob)
+            (Path(tmp) / "second.dxbc").write_bytes(blob)
+            for stdout, stderr, diagnostic in [
+                ("partial output", "compiler failed", "compiler failed"),
+                ("stdout only", "", "stdout only"),
+                ("", "", ""),
+            ]:
+                with self.subTest(diagnostic=diagnostic):
+                    failure = subprocess.CompletedProcess([], 23, stdout, stderr)
+                    out, err = io.StringIO(), io.StringIO()
+                    with patch.object(subprocess, "run", return_value=failure) as disasm:
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            self.assertEqual(main([tmp]), 23)
+                    self.assertEqual(disasm.call_count, 1)
+                    self.assertEqual(disasm.call_args.args[0], [sys.executable, "disasm", str(shader)])
+                    lines = ["first.dxbc: xcl disasm exited with code 23"]
+                    if diagnostic:
+                        lines.append(diagnostic)
+                    self.assertEqual(err.getvalue().splitlines(), lines)
+                    self.assertEqual(out.getvalue(), "")
+
     def test_disasm_matching_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             # Build synthetic DXBC container with RTS0
