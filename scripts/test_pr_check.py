@@ -1,4 +1,7 @@
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from pr_check import check, smoke_blocks
@@ -142,6 +145,22 @@ class HeadingFormTests(unittest.TestCase):
     def problems(self, body):
         return check(body, HEAD, [changed("README.md")], lambda _: True)
 
+    def test_body_file_with_or_without_utf8_bom(self):
+        script = Path(__file__).with_name("pr_check.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / "body.md"
+            files = Path(tmp) / "files.tsv"
+            files.write_text("README.md\tmodified\tfalse\tunused\n", encoding="utf-8")
+            for encoding in ("utf-8", "utf-8-sig"):
+                with self.subTest(encoding=encoding):
+                    body.write_bytes(("## Tested\r\nRésumé checked\r\n## Not tested\r\nRetail titles\r\n"
+                                      "## AI use\r\nCodex with GPT-6 wrote the fixture\r\n").encode(encoding))
+                    result = subprocess.run([sys.executable, "-B", str(script), "--local", "--body",
+                                             str(body), "--head", HEAD, "--files", str(files)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("description ok", result.stdout)
+
     def test_markdown_headings_and_any_case_pass(self):
         for tested, not_tested, ai in (("## Tested", "## Not Tested", "## AI Use"),
                                        ("### **Tested**", "# not tested #", "###### AI use"),
@@ -155,8 +174,10 @@ class HeadingFormTests(unittest.TestCase):
         self.assertEqual(3, len(self.problems(body)))
 
     def test_markdown_heading_ends_the_section_before_it(self):
-        body = "## Tested\n\n## Not tested\nRetail titles\n## AI use\nNone\n"
-        self.assertEqual(["the **Tested** section is missing or empty"], self.problems(body))
+        for gap in ("\n", "\n\n"):
+            with self.subTest(gap=gap):
+                body = "## Tested" + gap + "## Not tested\nRetail titles\n## AI use\nNone\n"
+                self.assertEqual(["the **Tested** section is missing or empty"], self.problems(body))
 
     def test_heading_words_in_a_sentence_are_not_headings(self):
         body = "## Tested things\nok\n## Not tested\nRetail titles\n## AI use\nNone\n"
