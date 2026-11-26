@@ -40,10 +40,15 @@ class TilingTableSpacingTests(unittest.TestCase):
             expected = output.read_bytes()
             self.assertIn(b"pub static PATTERNS_3D", expected)
 
-            source.write_text(plain.replace("\n};", "\n\t } ;"), encoding="utf-8")
-            result = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_bytes(), expected)
+            mixed = plain.replace("0, 0, 0, 0, 0}\n};", "0, 0, 0, 0, 0} };", 1)
+            for header in (plain.replace("\n};", "\n\t } ;"), mixed,
+                           plain.replace("\n};", ", /* }; */ } ;"),
+                           plain.replace("\n};", " // }; in a comment\n}\n;")):
+                with self.subTest(header=header):
+                    source.write_text(header, encoding="utf-8")
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_bytes(), expected)
 
 
 if __name__ == "__main__":
