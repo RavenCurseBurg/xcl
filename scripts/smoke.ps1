@@ -12,7 +12,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     # WaitForExit takes signed 32-bit milliseconds, including the 120-second grace period.
-    [ValidateRange(1, 2147363)][int]$Seconds = 60,
+    [ValidateRange(0, 2147363)][int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
     [string]$Title
 )

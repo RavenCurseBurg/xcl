@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $smoke = Join-Path $PSScriptRoot 'smoke.ps1'
 $missingExe = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString() + '.exe')
 
-foreach ($duration in @(-121, 0, 2147364)) {
+foreach ($duration in @(-121, -1, 2147364)) {
     try {
         & $smoke -Game 'unused' -Seconds $duration -Xcl $missingExe
     } catch {
@@ -13,7 +13,7 @@ foreach ($duration in @(-121, 0, 2147364)) {
     throw "Expected parameter validation to reject -Seconds $duration."
 }
 
-foreach ($duration in @(1, 2147363)) {
+foreach ($duration in @(0, 1, 2147363)) {
     try {
         & $smoke -Game 'unused' -Seconds $duration -Xcl $missingExe
     } catch {
