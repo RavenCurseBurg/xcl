@@ -36,7 +36,8 @@ def layout(r):
 
 ok = bad = 0
 for name in sorted(os.listdir(D)):
-    blob = open(os.path.join(D, name), 'rb').read()
+    with open(os.path.join(D, name), 'rb') as shader:
+        blob = shader.read()
     rs = next((p for cc, p in parts(blob) if cc == 'RTS0'), None)
     if rs is None:
         print(name, 'no embedded root signature (RTS0); skipped')
