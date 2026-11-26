@@ -71,7 +71,8 @@ class BannedModelTests(unittest.TestCase):
 
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        run = ("title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+               "peak commit: 100 MB\n")
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"
                 "xcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
         blocks = smoke_blocks(body)

@@ -23,8 +23,10 @@ checked before anything else; a PR that does not meet them waits (or is closed a
    time. The PR's block must name its head commit with no uncommitted changes (rerun it after every
    push); the other must be made on a commit of `main`. The PR's run must show no device removal and
    no crash (the `main` run may: a PR that fixes a crash shows it there), at least 80 % of `main`'s
-   frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
-   changes still counts as a regression check; say what it does not cover under **Not tested**.
+   frames and at most 125 % of its peak commit. Both runs must report a numeric `peak commit`;
+   a missing value or `n/a` cannot establish the memory comparison. A run on a title that does not
+   reach the code the PR changes still counts as a regression check; say what it does not cover
+   under **Not tested**.
    `scripts/pr_check.py` checks all of this (and the rest of this list it can see) on every PR.
    If a test-only diff touches a runtime file, a maintainer can apply the `test-only` label after
    reviewing the diff. The label event waives only the smoke check for that revision. Adding or
