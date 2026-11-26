@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_rdna2 import generate, DEFAULT_OUT
@@ -199,6 +200,22 @@ SYNTHETIC_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 
 class GenRdna2CliTests(unittest.TestCase):
+    def test_missing_instruction_encodings_preserves_output(self):
+        root = ET.fromstring(SYNTHETIC_XML)
+        instruction = root.find(".//Instruction[InstructionName='S_BRANCH']")
+        instruction.remove(instruction.find("InstructionEncodings"))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "isa.xml"
+            out = Path(tmp) / "spec.rs"
+            src.write_bytes(ET.tostring(root, encoding="utf-8"))
+            out.write_bytes(b"previous table")
+            result = subprocess.run([sys.executable, "-B", str(SCRIPT), str(src), str(out)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("S_BRANCH", result.stderr)
+            self.assertIn("InstructionEncodings", result.stderr)
+            self.assertEqual(out.read_bytes(), b"previous table")
+
     def test_help_flag_prints_usage_and_exits_zero(self):
         for flag in ("-h", "--help"):
             with self.subTest(flag=flag):

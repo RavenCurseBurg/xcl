@@ -106,35 +106,36 @@ def generate(xml_input):
         encs = []
         always_lit = False
         inst_encs = i.find("InstructionEncodings")
-        if inst_encs is not None:
-            for ie in inst_encs:
-                ename = ie.findtext("EncodingName")
-                cond = ie.findtext("EncodingCondition") or ""
-                primary = ename.startswith("ENC_") or ename == "VOP3_SDST_ENC"
-                if "LITERAL" in ename and cond == "default":
-                    # e.g. V_FMAMK_F32 / S_SETREG_IMM32_B32: the literal is part of the
-                    # instruction, so the "literal" encoding is its only form – map it onto
-                    # the base encoding and flag the extra dword.
-                    always_lit = True
-                    base = "ENC_" + ename.replace("_INST_LITERAL", "")
-                    if base in enc_index:
-                        ename, primary = base, True
-                if not primary or not cond.startswith(("default", "Nothas")):
-                    continue
-                ops = []
-                operands = ie.find("Operands")
-                if operands is not None:
-                    for o in sorted(operands, key=lambda o: int(o.get("Order", "0"))):
-                        ops.append((
-                            o.findtext("FieldName"),
-                            o.findtext("OperandType") or "",
-                            int(o.findtext("OperandSize") or "0"),
-                            o.get("Input") == "true",
-                            o.get("Output") == "true",
-                            o.get("IsImplicit") == "true",
-                        ))
-                encs.append((enc_index[ename], int(ie.findtext("Opcode")), ops))
-                primary_used.add(ename)
+        if inst_encs is None:
+            raise ValueError(f"{name}: missing InstructionEncodings")
+        for ie in inst_encs:
+            ename = ie.findtext("EncodingName")
+            cond = ie.findtext("EncodingCondition") or ""
+            primary = ename.startswith("ENC_") or ename == "VOP3_SDST_ENC"
+            if "LITERAL" in ename and cond == "default":
+                # e.g. V_FMAMK_F32 / S_SETREG_IMM32_B32: the literal is part of the
+                # instruction, so the "literal" encoding is its only form – map it onto
+                # the base encoding and flag the extra dword.
+                always_lit = True
+                base = "ENC_" + ename.replace("_INST_LITERAL", "")
+                if base in enc_index:
+                    ename, primary = base, True
+            if not primary or not cond.startswith(("default", "Nothas")):
+                continue
+            ops = []
+            operands = ie.find("Operands")
+            if operands is not None:
+                for o in sorted(operands, key=lambda o: int(o.get("Order", "0"))):
+                    ops.append((
+                        o.findtext("FieldName"),
+                        o.findtext("OperandType") or "",
+                        int(o.findtext("OperandSize") or "0"),
+                        o.get("Input") == "true",
+                        o.get("Output") == "true",
+                        o.get("IsImplicit") == "true",
+                    ))
+            encs.append((enc_index[ename], int(ie.findtext("Opcode")), ops))
+            primary_used.add(ename)
         if encs:
             insts.append((name, flag, always_lit, encs))
 
