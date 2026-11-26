@@ -55,7 +55,7 @@ if ($env:XCL_DXC_DIR) {
     Write-Host "DXC:  $env:XCL_DXC_DIR" -ForegroundColor Green
 }
 if ($env:XCL_DXC_THREADS) {
-    Write-Host "Threads: $env:XCL_DXC_THREADS | Memory Reserve: $($env:XCL_MEMORY_RESERVE_GB) GB" -ForegroundColor Gray
+    Write-Host "Threads: $env:XCL_DXC_THREADS" -ForegroundColor Gray
 }
 
 & $XclExe run $GamePath $ExtraArgs
