@@ -9,6 +9,7 @@ $exe = Join-Path $root 'stand-in.exe'
 $null = [IO.Directory]::CreateDirectory($title)
 try {
     $env:LOCALAPPDATA = $root
+    . (Join-Path $PSScriptRoot 'xcl-launcher-options.ps1')
     $env:XCL_HOST = 'must not reach the child'
     Add-Type -OutputAssembly $exe -OutputType ConsoleApplication -TypeDefinition @'
 using System;
@@ -22,6 +23,14 @@ public class LauncherProbe {
     }
 }
 '@
+    $data = Resolve-XclDataRoot 'data [local]' $exe
+    if ($data -cne (Join-Path $root 'data [local]')) { throw "Relative data root: $data" }
+    if ((Resolve-XclDataRoot $title '') -cne $title) { throw 'Absolute data root changed' }
+    if ((Resolve-XclDataRoot '' '') -cne (Join-Path $root 'XCL')) { throw 'Default data root changed' }
+    $rejected = $false
+    try { $null = Resolve-XclDataRoot 'relative' $title }
+    catch { if ($_.Exception.Message -ne 'Select an XCL executable.') { throw }; $rejected = $true }
+    if (-not $rejected) { throw 'Directory accepted as the XCL executable for a relative data root' }
     & $launcher -Launch -Xcl $exe -Game $title -Preset Debugging -Options @{ XCL_THREAD_DUMP_AT = '5,10' }
     if ($LASTEXITCODE -ne 0) { throw 'First launch failed' }
     $probe = [IO.File]::ReadAllLines((Join-Path $root 'probe.txt'))

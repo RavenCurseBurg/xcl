@@ -1,3 +1,25 @@
+function Get-XclExecutable([string]$Path) {
+    $exe = if ($Path) { Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue }
+    if ($exe -isnot [IO.FileInfo] -or $exe.Extension -ne '.exe') { throw 'Select an XCL executable.' }
+    $exe
+}
+
+function Resolve-XclDataRoot([string]$Value, [string]$Executable) {
+    if (-not $Value) { return Join-Path $env:LOCALAPPDATA 'XCL' }
+    $root = [IO.Path]::GetPathRoot($Value)
+    if ($root.Length -gt 1 -and -not $root.EndsWith(':')) { return $Value }
+
+    # Start-Title gives the child the executable's directory as its working directory.
+    $base = (Get-XclExecutable $Executable).DirectoryName
+    if ($root -eq '\' -or $root -eq '/') {
+        $base = [IO.Path]::GetPathRoot($base)
+    } elseif ($root -and -not $base.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        # No per-drive working directory is passed to the child for another drive.
+        $base = $root + '\'
+    }
+    [IO.Path]::GetFullPath([IO.Path]::Combine($base, $Value.Substring($root.Length)))
+}
+
 function Get-XclOptions {
     param([string] $SourceRoot)
 

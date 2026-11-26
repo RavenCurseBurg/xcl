@@ -66,9 +66,8 @@ function Use-Preset([string]$Name) {
 
 function Start-Title {
     if (-not $state.Game -or -not $state.Xcl) { throw 'Select an XCL executable and a game location first.' }
-    $exe = Get-Item -LiteralPath $state.Xcl
+    $exe = Get-XclExecutable $state.Xcl
     $target = Get-Item -LiteralPath $state.Game
-    if ($exe -isnot [IO.FileInfo] -or $exe.Extension -ne '.exe') { throw 'Select an XCL executable.' }
     if ($target -is [IO.FileInfo] -and $target.Name -eq 'MicrosoftGame.config') { $target = $target.Directory }
     if ($target -isnot [IO.DirectoryInfo] -and $target.Extension -ne '.exe') {
         throw 'Select a game folder, executable, or MicrosoftGame.config.'
@@ -242,8 +241,7 @@ $bar = New-Bar 5
 Add-Button $bar 'Launch game' { Sync-Location; $null = Start-Title }
 Add-Button $bar 'Open XCL data...' {
     Sync-Location
-    $dir = $state.Options['XCL_DATA_ROOT']
-    if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'XCL' }
+    $dir = Resolve-XclDataRoot $state.Options['XCL_DATA_ROOT'] $state.Xcl
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "XCL creates this folder on launch: $dir" }
     Invoke-Item -LiteralPath $dir
 }

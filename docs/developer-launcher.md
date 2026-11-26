@@ -18,7 +18,8 @@ want to reuse. It starts the selected build with the same `xcl run` command used
 The launcher saves the locations, current values, and custom presets in
 `%LOCALAPPDATA%\XCL\developer-launcher.json` when you close it or launch a title. Use
 **Open XCL data...** to find the per-title `xcl.toml` and `logs` folder. If you set `XCL_DATA_ROOT`,
-it opens that directory instead. XCL creates title data when it runs.
+it opens that directory instead. A relative path starts in the selected XCL executable's directory.
+XCL creates title data when it runs.
 
 ## Presets and direct launches
 
