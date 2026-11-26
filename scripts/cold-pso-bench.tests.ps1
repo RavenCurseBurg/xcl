@@ -164,6 +164,15 @@ try {
     # A failed preparation has not replaced any timings; keep the previous complete result.
     $previousSummary = [Convert]::ToBase64String([IO.File]::ReadAllBytes($summary))
     $previousTiming = [Convert]::ToBase64String([IO.File]::ReadAllBytes($timing))
+    [IO.File]::WriteAllText($xcl, "@echo off`r`n> `"%~dp0unexpected-prep`" echo started`r`nexit /b 0`r`n")
+    $errorText = $null
+    try { & $bench -Shaders 'D:\pack' -Threads ' , , ' -Xcl $xcl -Out $caseOut *> $null }
+    catch { $errorText = $_.Exception.Message }
+    if ($errorText -notlike '-Threads:*' -or (Test-Path -LiteralPath (Join-Path $fixture 'unexpected-prep')) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($summary)) -ne $previousSummary) {
+        throw 'empty thread list must fail before preparation and preserve the previous summary'
+    }
+    'empty thread list preserves previous results: ok'
     [IO.File]::WriteAllText($xcl, "@echo off`r`nexit /b 7`r`n")
     $prepFailed = $false
     try { & $bench -Shaders 'D:\pack' -Threads 1 -Xcl $xcl -Out $caseOut *> $null }

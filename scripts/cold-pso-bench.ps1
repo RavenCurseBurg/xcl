@@ -28,6 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
 $Threads = @($Threads | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($Threads.Count -eq 0) { throw '-Threads: provide at least one thread count (for example, 4,8,12)' }
 foreach ($t in $Threads) { if ($t -notmatch '^[1-9]\d{0,3}$') { throw "-Threads: '$t' is not a thread count (give them as 4,8,12)" } }
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $null = New-Item -ItemType Directory -Force -Path $Out

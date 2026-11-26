@@ -134,7 +134,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
   sets the cap in KiB (0 turns it off).
 - **Cold PSO benchmark:** `scripts/cold-pso-bench.ps1 -Shaders <pack-or-folder> -Threads 4,8`
-  writes a thread-count comparison to `summary.csv`. A missing, empty or malformed timing file
+  writes a thread-count comparison to `summary.csv`. Supply at least one thread count. An empty
+  list stops before preparation and preserves the previous CSV. A missing, empty or malformed timing file
   stops the run instead of reporting a zero-cost measurement. After successful preparation, a new
   measurement pass removes the old summary and replaces it only when every timing file is valid.
   If an old timing file cannot be removed (for example, it is locked or read-only), the run stops
