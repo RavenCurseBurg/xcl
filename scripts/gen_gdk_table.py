@@ -41,6 +41,10 @@ def main(argv=None):
         print(__doc__.strip())
         return 0 if (args and args[0] in ('-h', '--help')) else 2
 
+    if len(args) > 2:
+        print("usage: python scripts/gen_gdk_table.py <table file> [out_rs]", file=sys.stderr)
+        return 2
+
     table_path = args[0]
     if not os.path.isfile(table_path):
         print(f"error: file not found: '{table_path}'", file=sys.stderr)

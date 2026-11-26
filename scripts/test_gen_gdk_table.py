@@ -41,6 +41,21 @@ class GenGdkTableCliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 2)
         self.assertIn("usage: python scripts/gen_gdk_table.py", res.stdout)
 
+    def test_surplus_argument_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "input.txt"
+            src.write_text(SAMPLE_INPUT, encoding="utf-8")
+            output = Path(tmp) / "table.rs"
+            original = b"previous table\r\n"
+            output.write_bytes(original)
+            res = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), str(src), str(output), "extra"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertIn("usage:", res.stderr)
+            self.assertEqual(output.read_bytes(), original)
+
     def test_nonexistent_file_exits_code_1_with_error(self):
         res = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), "nonexistent_gdk_table.txt"],

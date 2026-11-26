@@ -141,6 +141,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ## Tests
 
+To regenerate the GDK runtime table, run `python scripts/gen_gdk_table.py <table-file> [out_rs]`.
+An extra positional argument exits with a usage error and preserves the output file.
+
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
