@@ -19,22 +19,31 @@ function New-Object([string]$TypeName) {
     Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName @args
 }
 
-function Assert-Exit([bool]$ExitedInTime, [string]$Expected) {
+function Assert-Exit([bool]$ExitedInTime, [string]$Expected, [int]$ExitCode = 0, [switch]$NoLog) {
+    $stdout = if ($NoLog) { 'startup output' } else { "Log: $log" }
     $process = [pscustomobject]@{
         StartInfo = $null
-        StandardOutput = [IO.StringReader]::new("Log: $log")
-        StandardError = [IO.StringReader]::new('')
+        StandardOutput = [IO.StringReader]::new($stdout)
+        StandardError = [IO.StringReader]::new('startup details')
         ExitedInTime = $ExitedInTime
         HasExited = $ExitedInTime
-        ExitCode = 0
+        ExitCode = $ExitCode
     }
     $process | Add-Member ScriptMethod Start { $true }
     $process | Add-Member ScriptMethod WaitForExit { if ($args.Count) { $this.ExitedInTime } }
     $process | Add-Member ScriptMethod Kill { $this.HasExited = $true }
 
-    $output = & $Smoke -Game $fixture -Xcl $PSCommandPath
-    if (($output -split "\r?\n") -notcontains "exit: $Expected") {
-        throw "Expected exit: $Expected; smoke output: $output"
+    if ($NoLog) {
+        $diagnostic = ''
+        try { $null = & $Smoke -Game $fixture -Xcl $PSCommandPath } catch { $diagnostic = $_.Exception.Message }
+        foreach ($part in "exit: $Expected", 'startup output', 'startup details') {
+            if (!$diagnostic.Contains($part)) { throw "Missing '$part' in startup error: $diagnostic" }
+        }
+    } else {
+        $output = & $Smoke -Game $fixture -Xcl $PSCommandPath
+        if (($output -split "\r?\n") -notcontains "exit: $Expected") {
+            throw "Expected exit: $Expected; smoke output: $output"
+        }
     }
     if (!$process.HasExited) { throw 'The timed-out child was not killed.' }
 }
@@ -47,7 +56,10 @@ try {
     Assert-Exit $true '0x0'
     $timedOut = $true
     Assert-Exit $true '0x0'
+    Assert-Exit $true '0x25' -ExitCode 37
+    Assert-Exit $true '0x25' -ExitCode 37 -NoLog
     Assert-Exit $false 'killed (no exit)'
+    Assert-Exit $false 'killed (no exit)' -NoLog
 } finally {
     $env:XCL_NETWORK = $oldNetwork
     $env:XCL_RUN_SECONDS = $oldSeconds
