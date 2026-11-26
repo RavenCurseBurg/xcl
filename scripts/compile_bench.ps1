@@ -38,8 +38,11 @@ try {
     foreach ($v in 'XCL_COMPILE_BENCH', 'XCL_COMPILE_BENCH_OUT', 'XCL_COMPILE_BENCH_REPS', 'XCL_COMPILE_BENCH_DXC_ARGS') { Remove-Item "env:$v" -ErrorAction SilentlyContinue }
 }
 $lines | Out-File -FilePath $log -Encoding utf8
-if ($code -eq 0 -and -not (Test-Path (Join-Path $Out 'compile_bench.json'))) {
-    Write-Warning 'no compile_bench.json: the test was skipped (no DXC?), see the log'
+# The Rust test prints this line after both writes succeed. Read this invocation's
+# captured output so a skipped rerun cannot reuse an earlier JSON file.
+$wroteReport = $lines -clike 'written: *\compile_bench.json, compile_bench.csv'
+if ($code -eq 0 -and (-not $wroteReport -or -not (Test-Path -LiteralPath (Join-Path $Out 'compile_bench.json') -PathType Leaf))) {
+    Write-Warning 'no compile_bench.json from this run: the test was skipped (no DXC?), see the log'
     $code = 1
 }
 Write-Host "commit $commit$(if ($dirty) { ' (dirty)' }), results and log: $Out"
