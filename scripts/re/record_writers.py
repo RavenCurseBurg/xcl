@@ -52,16 +52,18 @@ def _writes_reg(insn, reg):
     aliases = _reg_aliases(reg)
     if mn.startswith('call'):
         return True
-    if mn.startswith(('cmp', 'test', 'j', 'nop', 'prefetch')) or mn in ('bt', 'ret', 'retq'):
+    if mn.startswith('cmpxchg'):
+        # Failure loads the accumulator, or the high:low pair for a double-width compare.
+        if 'rax' in aliases or (mn in ('cmpxchg8b', 'cmpxchg16b') and 'rdx' in aliases):
+            return True
+    elif mn.startswith(('cmp', 'test', 'j', 'nop', 'prefetch')) or mn in ('bt', 'ret', 'retq'):
         return False
     ops = _split_operands(tokens[1]) if len(tokens) > 1 else []
     if (mn.startswith(('mul', 'div', 'idiv', 'cqto', 'cdq')) or (mn.startswith('imul') and len(ops) == 1)) and (aliases & {'rax', 'rdx'}):
         return True
-    if mn.startswith('cmpxchg') and (aliases & {'rax'}):
-        return True
     if not ops:
         return False
-    targets = ops if mn.startswith(('xchg', 'xadd', 'cmpxchg')) else [ops[-1]]
+    targets = ops if mn.startswith(('xchg', 'xadd')) else [ops[-1]]
     return any(op.startswith('%') and op[1:] in aliases for op in targets)
 
 lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()

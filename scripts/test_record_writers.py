@@ -9,6 +9,35 @@ SCRIPT = Path(__file__).resolve().parent / "re" / "record_writers.py"
 
 
 class RecordWriterTests(unittest.TestCase):
+    def test_cmpxchg_invalidates_only_possible_cursor_writes(self):
+        cases = (
+            ("rdx", "cmpxchgl %r8d,%edx", "None"),
+            ("rax", "lock cmpxchgq %r8,(%rbx)", "None"),
+            ("rdx", "lock cmpxchg8b (%rbx)", "None"),
+            ("rdx", "cmpxchg16b (%rbx)", "None"),
+            ("rdx", "cmpxchgq %rdx,%r9", "32"),
+            ("rdx", "cmpq %r8,%rdx", "32"),
+        )
+        for dst, instruction, expected in cases:
+            with self.subTest(instruction=instruction), tempfile.TemporaryDirectory() as tmp:
+                listing = Path(tmp) / "synthetic.asm"
+                listing.write_text(
+                    "   1000: mov 0x18(%rcx),%r10\n"
+                    "   1004: cmp 0x30(%rcx),%r10\n"
+                    "   1008: jae 1030\n"
+                    f"   100c: lea 0x20(%r10),%{dst}\n"
+                    f"   1010: {instruction}\n"
+                    f"   1014: mov %{dst},0x18(%rcx)\n"
+                    "   1018: ret\n"
+                    "   1030: call *0x40(%rbx)\n",
+                    encoding="ascii",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-B", str(SCRIPT), str(listing)],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertIn(f"length {expected} B", result.stdout)
+
     def test_branch_targets_with_and_without_hex_prefix(self):
         for target in ("180001030 <fallback>", "0x180001030 <fallback>"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
