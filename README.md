@@ -292,8 +292,8 @@ To summarize an existing test log without running tests again:
 .\scripts\summarize-tests.ps1 -LiteralPath .\test.log -Json
 ```
 
-The report lists completed-suite totals, `SKIPPED` records, explicitly named failed tests
-and sample inputs reported as unset. UTF-8 and UTF-16 logs are supported. A successful
+The report lists completed-suite totals, `SKIPPED` records, failed tests named in pretty
+or terse output, and sample inputs reported as unset. UTF-8 and UTF-16 logs are supported. A successful
 summary command means the log was read, not that the logged tests passed or that the
 whole run finished. Concatenated runs are summed, not deduplicated. Logs with no completed
 test-suite summaries are rejected.

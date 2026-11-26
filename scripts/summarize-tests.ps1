@@ -26,7 +26,9 @@ try {
         if ($line -match '^(?:test \S+ \.\.\. )?SKIPPED (\S+): (.+)$') {
             $skips.Add([pscustomobject]@{ Test = $Matches[1]; Reason = $Matches[2] })
         }
-        if ($line -match '^test (\S+) \.\.\. FAILED$') { $null = $failed.Add($Matches[1]) }
+        if ($line -match '^test (\S+) \.\.\. FAILED$' -or $line -cmatch '^(\S.*) --- FAILED$') {
+            $null = $failed.Add($Matches[1])
+        }
         if ($line -match '^not set, their tests are skipped: (.+)$') {
             foreach ($variable in [regex]::Matches($Matches[1], '\bXCL_SAMPLE_[A-Z0-9_]+\b')) {
                 $null = $missing.Add($variable.Value)

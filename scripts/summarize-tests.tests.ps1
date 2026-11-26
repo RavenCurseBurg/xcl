@@ -43,6 +43,19 @@ diagnostic: test result: ok. 999 passed; 0 failed; 0 ignored;
         if ($r.notes.Count -ne 3) { throw 'Missing limitations or false truncation warning.' }
         Write-Host "PASS $($encoding.WebName), ANSI, literal path, skips and failures"
     }
+    $terse = @"
+running 3 tests
+. 1/3
+unit::case --- $($esc)[31mFAILED$($esc)[0m
+src/lib.rs - example (line 8) --- FAILED
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out;
+"@
+    [IO.File]::WriteAllText($log, $terse, [Text.Encoding]::UTF8)
+    $r = Read-Report $log
+    if ($r.failed -ne 2 -or ($r.failed_tests -join '|') -ne 'src/lib.rs - example (line 8)|unit::case') {
+        throw 'Lost terse failure names.'
+    }
+    Write-Host 'PASS terse failure names'
     [IO.File]::WriteAllText($log, $text + "`nrunning 5 tests`n", [Text.Encoding]::UTF8)
     $r = Read-Report $log
     if ($r.completed_suites -ne 2 -or $r.notes[-1] -notlike '*incomplete*') { throw 'Missed incomplete suite.' }
