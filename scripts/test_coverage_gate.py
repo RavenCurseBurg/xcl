@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +73,29 @@ class SweepJsonTests(unittest.TestCase):
 
 
 class CliGateTests(unittest.TestCase):
+    def test_bare_xcl_name_is_resolved_on_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pack = root / "pack.rpf"
+            pack.touch()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            report = json.dumps(run())
+            if os.name == "nt":
+                binary = bin_dir / "xcl-coverage-fixture.cmd"
+                binary.write_text("@echo off\n" + "echo " + report + "\n", encoding="ascii")
+            else:
+                binary = bin_dir / "xcl-coverage-fixture"
+                binary.write_text("#!/bin/sh\nprintf '%s\\n' '" + report + "'\n", encoding="ascii")
+                binary.chmod(0o755)
+            output = root / "baseline.json"
+            script = Path(__file__).with_name("coverage_gate.py").resolve()
+            result = subprocess.run([sys.executable, "-B", str(script), "--xcl", binary.name,
+                                     "--rpf", str(pack), "--update", "--baseline", str(output)],
+                                    cwd=root, env=dict(os.environ, PATH=str(bin_dir)), capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), run())
+
     def test_missing_all_arguments_exits_two(self):
         with self.assertRaises(SystemExit) as cm:
             main([])

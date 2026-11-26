@@ -53,7 +53,7 @@ def compare(baseline, run):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--xcl", type=Path, help="xcl binary (required unless --run-json)")
+    ap.add_argument("--xcl", help="xcl executable name or path (required unless --run-json)")
     ap.add_argument("--rpf", type=Path, help="shader pack (required unless --run-json)")
     ap.add_argument("--threads", type=int, help="sweep threads (xcl default: up to 8)")
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
@@ -75,13 +75,10 @@ def main(argv=None):
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
-        if not args.xcl.is_file():
-            print(f"error: xcl binary not found: '{args.xcl}'", file=sys.stderr)
-            return 2
         if not args.rpf.is_file():
             print(f"error: shader pack not found: '{args.rpf}'", file=sys.stderr)
             return 2
-        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
+        cmd = [args.xcl, "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
         try:
