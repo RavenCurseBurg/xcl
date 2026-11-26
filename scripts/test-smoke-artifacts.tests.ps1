@@ -84,7 +84,11 @@ exit /b 0
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
     foreach ($name in $savedSettings.Keys) {
-        [Environment]::SetEnvironmentVariable($name, $savedSettings[$name])
+        if ($null -eq $savedSettings[$name]) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $savedSettings[$name])
+        }
     }
     if (Test-Path -LiteralPath $fixture) {
         Remove-Item -LiteralPath $fixture -Recurse -Force
