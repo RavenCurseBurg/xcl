@@ -160,6 +160,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+To regenerate the RDNA2 decoder table, run `python -I scripts/gen_rdna2.py <isa.xml> [output.rs]`.
+The generator reads the architecture from the XML and leaves the output untouched if it is missing or differs from AMD RDNA 2.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

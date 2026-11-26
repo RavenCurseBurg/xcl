@@ -3,6 +3,8 @@
 Input:  amdgpu_isa_rdna2.xml from https://gpuopen.com/machine-readable-isa/ (MIT licence)
 Usage:  python -I scripts/gen_rdna2.py <path/to/amdgpu_isa_rdna2.xml> [crates/xcl/src/gpu/rdna2_spec.rs]
 
+Other or missing architectures are rejected before the output is opened.
+
 Only the "primary" encodings (condition "default") are emitted with operands; the
 literal / SDWA / DPP / NSA variants are derived at decode time from operand values,
 exactly as the hardware does. Instructions that *always* carry a literal (e.g.
@@ -48,10 +50,9 @@ def generate(xml_input):
     if doc is None or isa is None:
         raise ValueError("missing required 'Document' or 'ISA' element in XML root")
 
-    arch_elem = isa.find("Architecture")
-    if arch_elem is None:
-        raise ValueError("missing required 'Architecture' element in 'ISA'")
-    arch = arch_elem.findtext("ArchitectureName") or ""
+    arch = isa.findtext("Architecture/ArchitectureName")
+    if arch != "AMD RDNA 2":
+        raise ValueError(f"expected AMD RDNA 2 specification, got {arch!r}")
 
     enc_elem = isa.find("Encodings")
     if enc_elem is None:
