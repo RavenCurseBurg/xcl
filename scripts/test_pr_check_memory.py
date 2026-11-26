@@ -35,6 +35,12 @@ class SmokeMemoryTests(unittest.TestCase):
         self.assertEqual([], problems("100 MB", "125 MB"))
         self.assertTrue(problems("100 MB", "126 MB"))
 
+    def test_zero_measurements_name_the_run_that_needs_a_peak(self):
+        self.assertEqual(["the main regression run needs a positive peak commit measurement"],
+                         problems("0 MB", "400 MB"))
+        self.assertEqual(["the PR's regression run needs a positive peak commit measurement"],
+                         problems("100 MB", "0 MB"))
+
 
 if __name__ == "__main__":
     unittest.main()
