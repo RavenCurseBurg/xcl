@@ -157,6 +157,7 @@ tests pass without running anything (`scripts/test.ps1` lists the ones not set).
 part of the repository.
 
 Run `python scripts/re/check_layout.py <shader-directory>` to check root-argument layouts.
+The checker reports scalar loads that extend beyond the packed table, even when they start on a parameter.
 Set `XCL_EXE` to select a specific build. If disassembly fails, the checker prints the
 shader filename and diagnostic, stops scanning, and exits with the disassembler's status.
 
