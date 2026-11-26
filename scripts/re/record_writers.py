@@ -6,6 +6,66 @@ the vtable slot of the fallback call. Branch targets may have or omit the 0x pre
 usage: objdump -d --no-show-raw-insn XboxBvhBuilder.dll > bvhb.asm; python record_writers.py bvhb.asm"""
 import re, collections, sys
 
+REG_FAMILIES = (
+    {'rax', 'eax', 'ax', 'al', 'ah'},
+    {'rbx', 'ebx', 'bx', 'bl', 'bh'},
+    {'rcx', 'ecx', 'cx', 'cl', 'ch'},
+    {'rdx', 'edx', 'dx', 'dl', 'dh'},
+    {'rsi', 'esi', 'si', 'sil'},
+    {'rdi', 'edi', 'di', 'dil'},
+    {'rbp', 'ebp', 'bp', 'bpl'},
+    {'rsp', 'esp', 'sp', 'spl'},
+    *({f'r{n}', f'r{n}d', f'r{n}w', f'r{n}b'} for n in range(8, 16)),
+)
+PREFIXES = {'lock', 'rep', 'repe', 'repz', 'repne', 'repnz'}
+
+
+def _reg_aliases(reg):
+    for fam in REG_FAMILIES:
+        if reg in fam:
+            return fam
+    return {reg}
+
+
+def _split_operands(text):
+    ops, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth = max(0, depth - 1)
+        elif ch == ',' and depth == 0:
+            ops.append(text[start:i].strip())
+            start = i + 1
+    if text[start:].strip():
+        ops.append(text[start:].strip())
+    return ops
+
+
+def _writes_reg(insn, reg):
+    tokens = insn.split(None, 1)
+    while tokens and tokens[0] in PREFIXES:
+        tokens = tokens[1].split(None, 1) if len(tokens) > 1 else []
+    if not tokens:
+        return False
+    mn = tokens[0]
+    aliases = _reg_aliases(reg)
+    if mn.startswith('call'):
+        return True
+    if mn.startswith('cmpxchg'):
+        # Failure loads the accumulator, or the high:low pair for a double-width compare.
+        if 'rax' in aliases or (mn in ('cmpxchg8b', 'cmpxchg16b') and 'rdx' in aliases):
+            return True
+    elif mn.startswith(('cmp', 'test', 'j', 'nop', 'prefetch')) or mn in ('bt', 'ret', 'retq'):
+        return False
+    ops = _split_operands(tokens[1]) if len(tokens) > 1 else []
+    if (mn.startswith(('mul', 'div', 'idiv', 'cqto', 'cdq')) or (mn.startswith('imul') and len(ops) == 1)) and (aliases & {'rax', 'rdx'}):
+        return True
+    if not ops:
+        return False
+    targets = ops if mn.startswith(('xchg', 'xadd')) else [ops[-1]]
+    return any(op.startswith('%') and op[1:] in aliases for op in targets)
+
 lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
 ins = []
 for l in lines:
@@ -43,10 +103,21 @@ for i, (a, t) in enumerate(ins):
             cursor_updated = True
             if length is None:
                 dst = store.group(1)
-                for tb in body:
+                # lea 0xN(%P),%dst style: trust only when %P is untouched beforehand and %dst survives to the store
+                p_clean = True
+                lea_len = None
+                for tb in body[:-1]:
                     ml = re.match(rf'lea\s+0x([0-9a-f]+)\(%{P}\),%{dst}$', tb)
                     if ml:
-                        length = int(ml.group(1), 16)
+                        lea_len = int(ml.group(1), 16) if p_clean else None
+                        if _reg_aliases(dst) == _reg_aliases(P):
+                            p_clean = False
+                    else:
+                        if _writes_reg(tb, dst):
+                            lea_len = None
+                        if _writes_reg(tb, P):
+                            p_clean = False
+                length = lea_len
             break
     if not cursor_updated:
         continue
