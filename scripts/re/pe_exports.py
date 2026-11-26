@@ -21,24 +21,28 @@ def parse_exports(b):
         raise ValueError("not a valid PE: missing PE signature")
     nsec = struct.unpack_from("<H", b, pe + 6)[0]
     opt = pe + 24
-    if len(b) < opt + 2:
+    opt_size = struct.unpack_from("<H", b, pe + 20)[0]
+    opt_end = opt + opt_size
+    if opt_size < 2 or len(b) < opt_end:
         raise ValueError("truncated optional header")
     magic = struct.unpack_from("<H", b, opt)[0]
     if magic not in (0x10B, 0x20B):
         raise ValueError(f"unsupported PE optional header magic: {hex(magic)}")
     dd = opt + (112 if magic == 0x20B else 96)
-    if len(b) < dd + 8:
-        raise ValueError("truncated data directories")
-    headers_size = struct.unpack_from("<I", b, opt + 60)[0]
-    exp_rva, exp_size = struct.unpack_from("<II", b, dd)
+    exp_rva = exp_size = 0
+    if dd + 8 <= opt_end and struct.unpack_from("<I", b, dd - 4)[0] > 0:
+        exp_rva, exp_size = struct.unpack_from("<II", b, dd)
     secs = []
-    so = opt + struct.unpack_from("<H", b, pe + 20)[0]
     for i in range(nsec):
-        sec_off = so + 40 * i
+        sec_off = opt_end + 40 * i
         if len(b) < sec_off + 40:
             raise ValueError(f"truncated section header {i}")
         vs, va, raw_sz, raw = struct.unpack_from("<IIII", b, sec_off + 8)
         secs.append((va, max(vs, raw_sz), raw))
+
+    if not exp_rva:
+        return None
+    headers_size = struct.unpack_from("<I", b, opt + 60)[0]
 
     def off(rva):
         if 0 <= rva < min(headers_size, len(b)):
@@ -57,9 +61,6 @@ def parse_exports(b):
         if null_pos == -1:
             raise ValueError(f"unterminated string at offset {hex(o)}")
         return b[o:null_pos].decode("latin1")
-
-    if not exp_rva:
-        return None
 
     e = off(exp_rva)
     if len(b) < e + 40:

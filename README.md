@@ -176,7 +176,8 @@ tests pass without running anything (`scripts/test.ps1` lists the ones not set).
 part of the repository.
 
 `python scripts/re/pe_exports.py <file> [<file> ...]` lists PE32/PE32+ exports, including
-tables and names stored in the image headers as well as in sections.
+tables and names stored in the image headers as well as in sections. Images declaring zero
+data directories are listed as `(no exports)`.
 
 ## Licenses
 
