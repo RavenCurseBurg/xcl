@@ -63,6 +63,40 @@ class RecordWriterTests(unittest.TestCase):
                     r"header imm 1234\s+length 32 B  bound \+0x30  fallback slot 8",
                 )
 
+    def test_timestamp_reads_overwrite_only_their_output_registers(self):
+        cases = (
+            ("rdtsc", "rax", "r9", True, "None"),
+            ("rdtsc", "r10", "rdx", False, "None"),
+            ("rdtsc", "r10", "r9", False, "32"),
+            ("rdtsc", "rax", "r9", False, "32"),
+            ("rdtsc", "r10", "rcx", False, "32"),
+            ("rdtscp", "rcx", "r9", True, "None"),
+            ("rdtscp", "r10", "rax", False, "None"),
+            ("rdtscp", "r10", "rdx", False, "None"),
+            ("rdtscp", "r10", "r9", False, "32"),
+        )
+        for op, base, dst, before, expected in cases:
+            with self.subTest(case=(op, base, dst, before)), tempfile.TemporaryDirectory() as tmp:
+                lea = f"lea 0x20(%{base}),%{dst}"
+                first, second = (op, lea) if before else (lea, op)
+                listing = Path(tmp) / "synthetic.asm"
+                listing.write_text(
+                    f"   1000: mov 0x18(%rdi),%{base}\n"
+                    f"   1004: cmp 0x30(%rdi),%{base}\n"
+                    "   1008: jae 1030\n"
+                    f"   100c: {first}\n"
+                    f"   1010: {second}\n"
+                    f"   1014: mov %{dst},0x18(%rdi)\n"
+                    "   1018: ret\n"
+                    "   1030: call *0x40(%rbx)\n",
+                    encoding="ascii",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-B", str(SCRIPT), str(listing)],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertIn(f"length {expected} B", result.stdout)
+
     def test_lea_length_matches_pointer_and_stored_register(self):
         cases = (
             (
