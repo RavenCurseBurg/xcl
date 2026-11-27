@@ -50,6 +50,8 @@ def _writes_reg(insn, reg):
         return False
     mn = tokens[0]
     aliases = _reg_aliases(reg)
+    if mn in ('rdtsc', 'rdtscp'):
+        return bool(aliases & {'rax', 'rdx'}) or (mn == 'rdtscp' and 'rcx' in aliases)
     if mn.startswith('call'):
         return True
     if mn.startswith('cmpxchg'):
