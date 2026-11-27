@@ -33,10 +33,12 @@ struct Backing {
 }
 
 impl Backing {
+    unsafe fn in_flight(&self) -> bool {
+        self.marks.values().chain(self.retired.iter()).any(|(f, v)| f.GetCompletedValue() < *v)
+    }
+
     unsafe fn free(&self) -> bool {
-        self.users.is_empty()
-            && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
-            && self.retired.iter().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && !self.in_flight()
     }
 
     fn clear_marks(&mut self) {
@@ -299,7 +301,7 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.in_flight());
     busy
 }
 
@@ -711,6 +713,7 @@ mod tests {
                 && !unsafe { s.backings[&alloc_busy].free() }
         };
         let busy_in_flight = in_flight(list_busy);
+        let allocator_busy_after_release = unsafe { allocator_in_flight(alloc_busy) };
         let pending_refs_while_busy = f_pending.refs.load(Ordering::Relaxed);
 
         // A later queue reusing `q_busy` finishes immediately, but `alloc_busy` stays busy
@@ -723,9 +726,11 @@ mod tests {
             s.fences.insert(q_busy, (fr, 1));
         }
         let still_busy_after_reuse = !unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc_busy].free() };
+        let allocator_busy_after_reuse = unsafe { allocator_in_flight(alloc_busy) };
 
         f_pending.value.store(5, Ordering::Relaxed);
         let free_after_retired_completes = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc_busy].free() };
+        let allocator_busy_after_completion = unsafe { allocator_in_flight(alloc_busy) };
         forget_queue(q_busy);
         let orphaned_last_reaped = !STATE.lock().unwrap().as_ref().unwrap().last_submit.contains_key(&list_busy);
 
@@ -741,9 +746,12 @@ mod tests {
         assert_eq!(f_done.refs.load(Ordering::Relaxed), 0, "completed fence refcount hits zero immediately");
         assert!(pending_preserved, "pending mark moves to retired and last_submit clears queue key");
         assert!(busy_in_flight, "in-flight list stays in_flight after queue release");
+        assert!(allocator_busy_after_release, "allocator stays in flight while a released queue's fence is pending");
         assert_eq!(pending_refs_while_busy, 2, "only pending retired mark and in-flight last_submit hold the fence");
         assert!(still_busy_after_reuse, "reusing queue address must not overwrite a retired pending fence");
+        assert!(allocator_busy_after_reuse, "a completed mark on the new queue must not hide a pending retired mark");
         assert!(free_after_retired_completes, "backing becomes free once retired fence completes");
+        assert!(!allocator_busy_after_completion, "allocator is idle once both fences have completed");
         assert!(orphaned_last_reaped, "completed orphaned last_submit is reaped on queue release");
         assert_eq!(f_pending.refs.load(Ordering::Relaxed), 0, "retired fence refcount hits zero once completed and reaped");
         assert_eq!(f_reused.refs.load(Ordering::Relaxed), 0, "reused queue fence refcount hits zero on release");
