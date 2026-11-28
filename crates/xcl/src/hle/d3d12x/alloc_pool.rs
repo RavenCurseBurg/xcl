@@ -649,7 +649,7 @@ impl PendingSubmit {
             || {
                 let mut dev: Option<ID3D12Device> = None;
                 q.GetDevice(&mut dev).ok()?;
-                dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+                super::real::create_pc_fence(&dev?)
             },
             |fence, value| super::real::native_queue_signal(q, fence, value).is_ok(),
         ))
@@ -666,7 +666,7 @@ impl PendingSubmit {
             || {
                 let mut dev: Option<ID3D12Device> = None;
                 q.GetDevice(&mut dev).ok()?;
-                dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+                super::real::create_pc_fence(&dev?)
             },
             |fence, value| super::real::native_queue_signal(q, fence, value).is_ok(),
         ))

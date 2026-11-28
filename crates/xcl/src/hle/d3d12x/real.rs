@@ -3738,6 +3738,7 @@ macro_rules! creator {
                 adopt(*ppv, $kind);
                 if $kind == Kind::CommandQueue {
                     super::queue_submit::created(*ppv as usize);
+                    super::present::track_queue(*ppv as usize);
                 }
             }
             hr
@@ -4192,6 +4193,21 @@ unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flag
         }
     }
     hr
+}
+
+/// Create a private completion marker on the PC device without registering a title fence.
+pub(super) unsafe fn create_pc_fence(dev: &ID3D12Device) -> Option<ID3D12Fence> {
+    let raw = dev.as_raw();
+    if is_adopted(raw) {
+        type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateFence")));
+        let riid = &ID3D12Fence::IID as *const windows::core::GUID as *const GUID;
+        let mut out = std::ptr::null_mut();
+        let hr = f(raw, 0, D3D12_FENCE_FLAG_NONE, riid, &mut out);
+        (hr >= 0 && !out.is_null()).then(|| ID3D12Fence::from_raw(out))
+    } else {
+        dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+    }
 }
 
 /// End the title on purpose without leaving the process stuck in the driver: every fence it
@@ -9620,13 +9636,7 @@ fn forget_command_list(list: *mut c_void) {
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = super::queue_submit::release(this as usize, || f(this));
-    if n == 0 {
-        super::list_x::on_queue_release(this as usize);
-    } else if n == 1 {
-        super::present::retire_released_queue(this as usize);
-    }
-    n
+    super::queue_submit::release(this as usize, || f(this), || super::present::retire_released_queue(this as usize))
 }
 
 thread_local! {
@@ -10756,6 +10766,21 @@ mod queue_tests {
     use std::mem::{offset_of, size_of};
     use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue_Vtbl, ID3D12Fence_Vtbl};
 
+    #[test]
+    fn private_queue_markers_stay_out_of_the_title_fence_registry() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            adopt(dev.as_raw(), Kind::Device);
+            let marker = create_pc_fence(&dev).expect("private completion fence");
+            assert!(!is_fence(marker.as_raw() as usize));
+            assert!(!is_adopted(marker.as_raw()));
+            marker.Signal(1).unwrap();
+            assert_eq!(marker.GetCompletedValue(), 1);
+        }
+    }
+
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
         let d = [1u32, 2, 3, 4];
@@ -10888,7 +10913,7 @@ mod queue_tests {
         struct LeaseCleanup(usize);
         impl Drop for LeaseCleanup {
             fn drop(&mut self) {
-                crate::hle::d3d12x::queue_submit::release(self.0, || 0);
+                crate::hle::d3d12x::queue_submit::release(self.0, || 0, || unreachable!());
             }
         }
         let _lease_cleanup = LeaseCleanup(obj_ptr as usize);

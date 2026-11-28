@@ -1561,15 +1561,6 @@ pub(super) fn queue_identity(raw: usize) -> Option<super::title_textures::Writer
     LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == raw).map(|q| q.id)
 }
 
-/// Remove a released command queue so `KickoffX` never submits to a dead queue.
-pub(super) fn on_queue_release(queue: usize) {
-    let mut scratch = COPY_SCRATCH.lock().unwrap();
-    scratch.fences.remove(&queue);
-    scratch.collect_released();
-    drop(scratch);
-    stop_queue_submissions(queue);
-}
-
 /// Stop non-owning internal users (notably `KickoffX`) from selecting a retiring queue.
 pub(super) fn stop_queue_submissions(queue: usize) {
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
@@ -1582,12 +1573,12 @@ pub(super) fn stop_queue_submissions(queue: usize) {
     }
 }
 
-/// Remove every cached use of a retired raw queue address before it can be reused. This is later
-/// than `on_queue_release`: the retirement marker has completed, so old sync edges are finished.
+/// Remove every cached use of a retired raw queue address while its owner still pins the address.
+/// The retirement marker has completed, so old sync edges are finished.
 /// Cached COM fences are extracted and dropped after their locks are gone.
 pub(super) fn forget_queue(id: super::present::QueueId) {
     let queue = id.raw();
-    let scratch_fences = {
+    let retired_scratch = {
         let mut scratch = COPY_SCRATCH.lock().unwrap();
         let mut gone = Vec::new();
         if let Some((fence, _)) = scratch.fences.remove(&queue) {
@@ -1603,9 +1594,13 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
                 gone.push(fence);
             }
         }
-        gone
+        let buffers: Vec<_> = scratch.released
+            .extract_if(.., |s| !s.untracked_submission && s.marks.is_empty())
+            .collect();
+        scratch.bytes -= buffers.iter().map(|s| s.bytes).sum::<u64>();
+        (gone, buffers)
     };
-    drop(scratch_fences);
+    drop(retired_scratch);
     LIVE_QUEUES.lock().unwrap().retain(|info| info.queue != queue);
     if let Some(lists) = LISTS.lock().unwrap().as_mut() {
         for state in lists.values_mut() {
@@ -7084,12 +7079,12 @@ mod tests {
         let raw = 0x7ffe_1801usize;
         on_queue_create(raw, 0x2000, D3D12_COMMAND_LIST_TYPE_DIRECT);
         let first = queue_identity(raw).unwrap();
-        on_queue_release(raw);
+        stop_queue_submissions(raw);
         on_queue_create(raw, 0x2000, D3D12_COMMAND_LIST_TYPE_DIRECT);
         let second = queue_identity(raw).unwrap();
         assert_eq!((first.raw, second.raw), (raw, raw));
         assert_ne!(first.generation, second.generation);
-        on_queue_release(raw);
+        stop_queue_submissions(raw);
     }
 
     #[test]
@@ -7589,10 +7584,10 @@ mod tests {
         // Explicit last_queue wins when still live
         assert_eq!(pick_queue(Some(q1), dev, D3D12_COMMAND_LIST_TYPE_DIRECT), Some(q1));
         // Releasing q1 falls back to q2
-        on_queue_release(q1);
+        stop_queue_submissions(q1);
         assert_eq!(pick_queue(Some(q1), dev, D3D12_COMMAND_LIST_TYPE_DIRECT), Some(q2));
-        on_queue_release(q2);
-        on_queue_release(q_copy);
+        stop_queue_submissions(q2);
+        stop_queue_submissions(q_copy);
         assert_eq!(pick_queue(None, dev, D3D12_COMMAND_LIST_TYPE_DIRECT), None);
     }
 

@@ -625,7 +625,7 @@ pub(super) unsafe fn retire_released_queue(raw: usize) {
     let mark = (|| {
         let mut dev: Option<ID3D12Device> = None;
         queue.GetDevice(&mut dev).ok()?;
-        let fence = dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let fence = super::real::create_pc_fence(&dev?)?;
         super::real::native_queue_signal(&queue, &fence, 1).ok()?;
         Some(QueueRetirementMark { fence, value: 1 })
     })();
@@ -1825,6 +1825,26 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pc_queue_has_a_retirement_owner_before_its_first_submission() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            use super::super::real;
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+            let mut raw = std::ptr::null_mut();
+            let iid = &ID3D12CommandQueue::IID as *const windows::core::GUID;
+            let hr = real::dev_create_command_queue(dev.as_raw(), &desc as *const _ as usize, iid.cast(), &mut raw);
+            assert!(hr >= 0 && !raw.is_null(), "creating the PC queue failed ({hr:#x})");
+            let queue = ID3D12CommandQueue::from_raw(raw);
+            let tracked = QUEUES.lock().unwrap().entries.iter().any(|entry| entry.id.raw == raw as usize);
+            assert!(tracked, "the registry must own the queue before callers can release or submit it");
+            drop(queue);
+        }
+    }
 
     #[test]
     fn owned_queue_registry_deduplicates_without_making_a_temporary_owner() {

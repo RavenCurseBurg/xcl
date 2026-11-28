@@ -90,16 +90,18 @@ pub(super) fn with<R>(queue: usize, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Forward Release and discard the raw-address lease after a final native release. Pointer
-/// identity prevents a newly created generation at the same address from being removed.
-pub(super) fn release(queue: usize, f: impl FnOnce() -> u32) -> u32 {
+/// Start retirement if only the registry owner remains. After the final native release the
+/// address is reusable, so only the captured lease can be discarded.
+pub(super) fn release(queue: usize, native: impl FnOnce() -> u32, retire_owner: impl FnOnce()) -> u32 {
     let old = leases().read().unwrap_or_else(|e| e.into_inner()).get(&queue).cloned();
-    let n = f();
+    let n = native();
     if n == 0 {
         let mut leases = leases().write().unwrap_or_else(|e| e.into_inner());
         if old.as_ref().is_some_and(|old| leases.get(&queue).is_some_and(|current| Arc::ptr_eq(old, current))) {
             leases.remove(&queue);
         }
+    } else if n == 1 {
+        retire_owner();
     }
     n
 }
@@ -156,7 +158,7 @@ mod tests {
         second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         first.join().unwrap();
         second.join().unwrap();
-        release(queue, || 0);
+        release(queue, || 0, || unreachable!());
     }
 
     #[test]
@@ -171,8 +173,8 @@ mod tests {
         with(0x5151_0003, || {});
         leave_tx.send(()).unwrap();
         first.join().unwrap();
-        release(0x5151_0002, || 0);
-        release(0x5151_0003, || 0);
+        release(0x5151_0002, || 0, || unreachable!());
+        release(0x5151_0003, || 0, || unreachable!());
     }
 
     #[test]
@@ -183,10 +185,14 @@ mod tests {
         let n = release(queue, || {
             created(queue);
             0
-        });
+        }, || panic!("a final native release must not retire a replacement"));
         assert_eq!(n, 0);
         assert!(!Arc::ptr_eq(&old, &lease(queue)));
-        release(queue, || 0);
+        let mut retired = false;
+        assert_eq!(release(queue, || 2, || unreachable!()), 2);
+        assert_eq!(release(queue, || 1, || retired = true), 1);
+        assert!(retired);
+        release(queue, || 0, || unreachable!());
     }
 
     #[test]
@@ -217,7 +223,7 @@ mod tests {
         });
         assert_eq!(NATIVE_SIGNAL.load(Ordering::Relaxed), 0x5151);
         assert_eq!(WRAPPER_SIGNAL.load(Ordering::Relaxed), 0, "the adopted title wrapper must be bypassed");
-        release(queue_raw as usize, || 0);
+        release(queue_raw as usize, || 0, || unreachable!());
     }
 
     fn old_waiter_count(queue: usize) -> usize {
