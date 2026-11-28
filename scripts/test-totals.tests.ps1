@@ -13,10 +13,16 @@ function Check-Run($name, $lines, $buildExit, $testExit, $summary, $skipSummary 
     $command = @"
 @echo off
 if "%1"=="build" exit /b $buildExit
+if "%1"=="bench" goto bench
 if not "%1"=="test" exit /b 127
 echo forwarded: %*
 type "%~dp0input.txt"
 exit /b $testExit
+
+:bench
+if not "%~2 %~3 %~4 %~5 %~6 %~7"=="-p xcl --bench * -- --test" exit /b 127
+if not "%~8"=="" exit /b 127
+exit /b 0
 "@
     [IO.File]::WriteAllText($cargo, $command, [Text.Encoding]::ASCII)
     [IO.File]::WriteAllText($inputLog, ($lines -join "`r`n") + "`r`n", [Text.Encoding]::ASCII)
