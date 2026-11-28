@@ -14,6 +14,10 @@ if "%1"=="build" (
     >&2 echo synthetic build progress
     exit /b 0
 )
+if "%1"=="bench" (
+    echo benchmark smoke %~2 %~3 %~4 %~5 %~6 %~7
+    exit /b 0
+)
 if "%1"=="test" (
     >&2 echo SKIPPED native_stderr: synthetic reason
     exit /b 0
@@ -27,8 +31,9 @@ exit /b 127
     if ($LASTEXITCODE -ne 0) { throw "Runner exited $LASTEXITCODE on a successful build." }
     $output = Get-Content -LiteralPath $log -Raw
     if (!$output.Contains('synthetic build progress') -or
+        !$output.Contains('benchmark smoke -p xcl --bench * -- --test') -or
         !$output.Contains('GPU tests skipped on this adapter: 1 (synthetic reason)')) {
-        throw 'Expected native build output and the GPU skip summary in the redirected log.'
+        throw 'Expected build progress, the benchmark smoke invocation and the GPU skip summary.'
     }
 } finally {
     Pop-Location
