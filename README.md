@@ -280,10 +280,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
 
-The script sums the reported passed, failed and ignored counts from completed test suites.
+Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
+(D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
+another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
+the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
+`scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
+those skips fail. Tests on real game data are opt-in through
+environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
+`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
+`XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
+tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
+part of the repository.
+
+`scripts/test.ps1` sums the reported passed, failed and ignored counts from completed test suites.
 If a run stops early, these totals cover only the suites that printed a result; the script
 preserves Cargo's exit code. A passed count can include tests that skipped their checks,
-as described below.
+as described above.
 
 To summarize an existing test log without running tests again:
 
@@ -297,18 +309,6 @@ and sample inputs reported as unset. UTF-8 and UTF-16 logs are supported. A succ
 summary command means the log was read, not that the logged tests passed or that the
 whole run finished. Concatenated runs are summed, not deduplicated. Logs with no completed
 test-suite summaries are rejected.
-
-Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
-(D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
-another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
-the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
-`scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
-those skips fail. Tests on real game data are opt-in through
-environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
-tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
-part of the repository.
 
 ## Contributing
 
