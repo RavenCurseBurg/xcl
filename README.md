@@ -274,6 +274,14 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
+  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
+  those on which the GPU completed at least one operation. For each, it names the translated
+  pipeline bound at the last operation DRED saw complete and those bound after it, by their
+  console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
+  requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
+  (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - To investigate a world-load pause, save a run's `xcl.log` with `XCL_ACTIVITY=1` (set by
   `scripts/smoke.ps1`) and `XCL_PSO_TRACE=1` for full driver compile tracing. Run
   `python scripts/world_load_stall.py path/to/xcl.log` on the saved file. It finds the final
@@ -289,14 +297,6 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   lists thread IDs and visible XCL offsets above their first title frame. The default host is
   `xcl.exe`. If you renamed the executable, pass its basename with `--host-exe xcl-main.exe`.
   Use those sampled candidates to investigate the pause. A short unwind can hide the title frame or XCL callers.
-- With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
-  XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
-  those on which the GPU completed at least one operation. For each, it names the translated
-  pipeline bound at the last operation DRED saw complete and those bound after it, by their
-  console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
-- `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
-  requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
-  (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
